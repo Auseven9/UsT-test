@@ -21,6 +21,12 @@ class LlmService extends GetxService {
   final lastGenerationTokens = 0.obs;
   final lastGenerationSpeed = 0.0.obs;
 
+  /// Context window size (in tokens) of the currently loaded model, as
+  /// configured at load time. 0 when no model is loaded. Consumers that
+  /// need to fit a prompt into the model's budget (see
+  /// [ConversationMemoryService]) read this rather than re-deriving it.
+  final contextSize = 0.obs;
+
   // ── Loading progress tracking ──────────────────────────────
   final isLoadingModel = false.obs;
   final loadingProgress = 0.0.obs; // 0.0 to 1.0
@@ -150,7 +156,7 @@ class LlmService extends GetxService {
       // Use smaller context on Android to prevent OOM kills.
       // Desktop can handle 2048, but Android devices with limited RAM
       // need 1024 to avoid the Low Memory Killer (LMK).
-      final contextSize = Platform.isAndroid ? 1024 : 2048;
+      final ctxTokens = Platform.isAndroid ? 1024 : 2048;
 
       // Map the string backend to GpuBackend enum
       final storage = Get.find<ChatStorageService>();
@@ -171,14 +177,14 @@ class LlmService extends GetxService {
 
       // Optimize threads: 4 for both generation and batch processing to keep memory stable.
       final params = ModelParams(
-        contextSize: contextSize,
-        gpuLayers: userGpuLayers, 
+        contextSize: ctxTokens,
+        gpuLayers: userGpuLayers,
         preferredBackend: parsedBackend,
-        numberOfThreads: Platform.numberOfProcessors > 4 ? 4 : 0, 
+        numberOfThreads: Platform.numberOfProcessors > 4 ? 4 : 0,
         numberOfThreadsBatch: Platform.numberOfProcessors > 4 ? 4 : 0,
       );
 
-      log?.info('Backend=$parsedBackend, GPU layers=$userGpuLayers, ctx=$contextSize, threads=${Platform.numberOfProcessors > 4 ? 4 : 0}', source: 'LLM');
+      log?.info('Backend=$parsedBackend, GPU layers=$userGpuLayers, ctx=$ctxTokens, threads=${Platform.numberOfProcessors > 4 ? 4 : 0}', source: 'LLM');
 
       await _engine!.loadModel(path, modelParams: params);
       progressTimer.cancel();
@@ -194,6 +200,7 @@ class LlmService extends GetxService {
       loadingStatusMsg.value = 'Ready!';
       isLoaded.value = true;
       loadedModelPath.value = path;
+      contextSize.value = ctxTokens;
       log?.info('Model loaded successfully: $filename', source: 'LLM');
 
       // Enable wake lock for inference on mobile (keeps app from being killed)
@@ -418,6 +425,7 @@ class LlmService extends GetxService {
     isLoaded.value = false;
     loadedModelPath.value = '';
     tokensPerSecond.value = 0.0;
+    contextSize.value = 0;
   }
 
   /// Unload the current model and free memory.

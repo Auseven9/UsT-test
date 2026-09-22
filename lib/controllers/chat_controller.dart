@@ -5,10 +5,12 @@ import '../models/chat_model.dart';
 import '../models/message_model.dart';
 import '../services/llm_service.dart';
 import '../services/chat_storage_service.dart';
+import '../services/conversation_memory_service.dart';
 
 class ChatController extends GetxController {
   final LlmService _llm = Get.find<LlmService>();
   final ChatStorageService _storage = Get.find<ChatStorageService>();
+  final ConversationMemoryService _memory = Get.find<ConversationMemoryService>();
 
   final chats = <ChatModel>[].obs;
   final activeChatId = RxnString();
@@ -89,11 +91,20 @@ class ChatController extends GetxController {
     _storage.saveChat(chat);
     chats.refresh();
 
-    // Build message history for LLM
-    final history = chat.messages
-        .where((m) => !m.isSystem)
-        .map((m) => m.toLlamaMessage())
-        .toList();
+    // Build message history for the LLM, trimmed to fit the active model's
+    // context window (newest turns kept, oldest dropped first — see
+    // ConversationMemoryService). The full history stays persisted in Hive
+    // regardless of what gets sent to the model.
+    final effectiveSystemPrompt = chat.systemPrompt.isNotEmpty
+        ? chat.systemPrompt
+        : systemPrompt.value;
+    final candidateMessages =
+        chat.messages.where((m) => !m.isSystem).toList();
+    final fittedMessages = await _memory.fitToContext(
+      candidateMessages,
+      systemPrompt: effectiveSystemPrompt,
+    );
+    final history = fittedMessages.map((m) => m.toLlamaMessage()).toList();
 
     // Start generation
     isGenerating.value = true;
@@ -106,9 +117,7 @@ class ChatController extends GetxController {
     try {
       final stream = _llm.generate(
         messages: history,
-        systemPrompt: chat.systemPrompt.isNotEmpty
-            ? chat.systemPrompt
-            : systemPrompt.value,
+        systemPrompt: effectiveSystemPrompt,
         temperature: temperature.value,
       );
 
