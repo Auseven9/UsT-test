@@ -67,10 +67,12 @@ class ChatBubble extends StatelessWidget {
                 padding: const EdgeInsets.only(bottom: 8),
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(10),
-                  child: Image.memory(
-                    base64Decode(imageBase64),
+                  child: ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 240, maxHeight: 240),
-                    fit: BoxFit.cover,
+                    child: Image.memory(
+                      base64Decode(imageBase64),
+                      fit: BoxFit.cover,
+                    ),
                   ),
                 ),
               ),
