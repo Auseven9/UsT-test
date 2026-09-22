@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:get/get.dart';
+import 'package:llamadart/llamadart.dart';
 
 import '../models/chat_model.dart';
 import '../models/message_model.dart';
@@ -70,13 +71,30 @@ class ChatController extends GetxController {
   }
 
   /// Send a user message and stream AI response.
-  Future<void> sendMessage(String text, {String? modelFilename}) async {
-    if (text.trim().isEmpty) return;
+  ///
+  /// [imageBase64]/[imageMimeType] attach an image (persisted with the
+  /// message, requires a loaded multimodal projector to actually be seen
+  /// by the model). [audioPath] attaches a local audio file for this turn
+  /// only — audio isn't persisted to chat history, unlike images.
+  Future<void> sendMessage(
+    String text, {
+    String? modelFilename,
+    String? imageBase64,
+    String? imageMimeType,
+    String? audioPath,
+  }) async {
+    final hasAttachment = imageBase64 != null || audioPath != null;
+    if (text.trim().isEmpty && !hasAttachment) return;
     final chat = activeChat;
     if (chat == null) return;
 
     // Add user message
-    final userMsg = MessageModel(role: MessageRole.user, content: text.trim());
+    final userMsg = MessageModel(
+      role: MessageRole.user,
+      content: text.trim(),
+      imageBase64: imageBase64,
+      imageMimeType: imageMimeType,
+    );
     chat.messages.add(userMsg);
     chat.autoTitle();
     chat.updatedAt = DateTime.now();
@@ -89,11 +107,24 @@ class ChatController extends GetxController {
     _storage.saveChat(chat);
     chats.refresh();
 
-    // Build message history for LLM
-    final history = chat.messages
-        .where((m) => !m.isSystem)
-        .map((m) => m.toLlamaMessage())
-        .toList();
+    // Build message history for the LLM, bounded to what the loaded
+    // model's context can actually hold (with room left for the reply).
+    final effectiveSystemPrompt = chat.systemPrompt.isNotEmpty
+        ? chat.systemPrompt
+        : systemPrompt.value;
+    final messages = await _buildBoundedMessages(chat, effectiveSystemPrompt);
+    if (audioPath != null && messages.isNotEmpty) {
+      // Audio isn't persisted (see MessageModel), so it's injected here,
+      // for this turn only, rather than round-tripped through history.
+      final last = messages.removeLast();
+      messages.add(
+        LlamaChatMessage.withContent(
+          role: last.role,
+          content: [...last.parts, LlamaAudioContent(path: audioPath)],
+        ),
+      );
+    }
+    final replyBudget = _replyTokenBudget;
 
     // Start generation
     isGenerating.value = true;
@@ -104,12 +135,10 @@ class ChatController extends GetxController {
     chats.refresh();
 
     try {
-      final stream = _llm.generate(
-        messages: history,
-        systemPrompt: chat.systemPrompt.isNotEmpty
-            ? chat.systemPrompt
-            : systemPrompt.value,
-        temperature: temperature.value,
+      final stream = _llm.generateChatCompletion(
+        messages: messages,
+        params: const GenerationParams()
+            .copyWith(temp: temperature.value, maxTokens: replyBudget),
       );
 
       await for (final token in stream) {
@@ -137,6 +166,46 @@ class ChatController extends GetxController {
       _storage.saveChat(chat);
       chats.refresh();
     }
+  }
+
+  /// Tokens reserved for the model's reply, taken out of the context
+  /// budget before history is packed in. Scales with context size — the
+  /// user can now set context size freely (see ChatStorageService), so
+  /// this isn't capped tightly to what only fit the old fixed 2048 max.
+  int get _replyTokenBudget =>
+      (_llm.contextSize * 0.25).round().clamp(128, 2048);
+
+  /// Build the message list sent to the model, dropping the oldest turns
+  /// once they no longer fit in the context window. The system prompt and
+  /// the most recent message are always kept, even if the latter alone
+  /// exceeds the remaining budget.
+  Future<List<LlamaChatMessage>> _buildBoundedMessages(
+    ChatModel chat,
+    String effectiveSystemPrompt,
+  ) async {
+    final budget = _llm.contextSize - _replyTokenBudget;
+    final systemTokens = effectiveSystemPrompt.isEmpty
+        ? 0
+        : await _llm.countTokens(effectiveSystemPrompt);
+    var remaining = budget - systemTokens;
+
+    final turns = chat.messages.where((m) => !m.isSystem).toList();
+    final kept = <MessageModel>[];
+    for (final msg in turns.reversed) {
+      final tokens = await _llm.countTokens(msg.content);
+      if (kept.isNotEmpty && tokens > remaining) break;
+      kept.insert(0, msg);
+      remaining -= tokens;
+    }
+
+    return [
+      if (effectiveSystemPrompt.isNotEmpty)
+        LlamaChatMessage.fromText(
+          role: LlamaChatRole.system,
+          text: effectiveSystemPrompt,
+        ),
+      ...kept.map((m) => m.toLlamaChatMessage()),
+    ];
   }
 
   /// Stop current generation.

@@ -27,6 +27,11 @@ class LlmService extends GetxService {
   final loadingStatusMsg = ''.obs;
   bool _loadingCancelled = false;
 
+  // Context size the currently loaded model was configured with.
+  // Callers need this to budget prompt history against the real limit.
+  int _contextSize = Platform.isAndroid ? 1024 : 2048;
+  int get contextSize => _contextSize;
+
   StreamSubscription? _generateSub;
 
   String get loadedModelFilename {
@@ -147,13 +152,14 @@ class LlmService extends GetxService {
         return;
       }
 
-      // Use smaller context on Android to prevent OOM kills.
-      // Desktop can handle 2048, but Android devices with limited RAM
-      // need 1024 to avoid the Low Memory Killer (LMK).
-      final contextSize = Platform.isAndroid ? 1024 : 2048;
-
       // Map the string backend to GpuBackend enum
       final storage = Get.find<ChatStorageService>();
+
+      // Context size is user-configurable (see ChatStorageService.contextSize).
+      // Default is still conservative on Android (1024) vs desktop (2048) to
+      // avoid the Low Memory Killer, but the user can raise it deliberately.
+      final contextSize = storage.contextSize;
+      _contextSize = contextSize;
       GpuBackend parsedBackend;
       switch (storage.backendType) {
         case 'vulkan':
@@ -196,6 +202,18 @@ class LlmService extends GetxService {
       loadedModelPath.value = path;
       log?.info('Model loaded successfully: $filename', source: 'LLM');
 
+      // Best-effort: load the user-configured multimodal projector (mmproj)
+      // for vision/audio input, if one is set and the file still exists.
+      // Failure here must not fail the (already-successful) text model load.
+      final mmprojPath = storage.mmprojPath;
+      if (mmprojPath.isNotEmpty && await File(mmprojPath).exists()) {
+        try {
+          await loadMultimodalProjector(mmprojPath);
+        } catch (e) {
+          log?.error('Multimodal projector load failed: $e', source: 'LLM');
+        }
+      }
+
       // Enable wake lock for inference on mobile (keeps app from being killed)
       final modelName = p.basenameWithoutExtension(path);
       await wakelockService?.enableForInference(modelName: modelName);
@@ -229,119 +247,6 @@ class LlmService extends GetxService {
     loadingProgress.value = 0.0;
     loadingStatusMsg.value = '';
     _loadingCancelled = false;
-  }
-
-  /// Tokens/patterns the model may emit that should be stripped from output.
-  /// Covers ChatML, Llama, Gemma, Phi, Mistral, and other common formats.
-  static final _stopPatterns = RegExp(
-    r'<\|end\|>'
-    r'|<\|eot_id\|>'
-    r'|<\|endoftext\|>'
-    r'|<\|im_end\|>'
-    r'|<\|im_start\|>'
-    r'|<end_of_turn>'
-    r'|<start_of_turn>'
-    r'|<\|assistant\|>'
-    r'|<\|user\|>'
-    r'|<\|system\|>'
-    r'|<\|pad\|>'
-    r'|</s>'
-    r'|<s>'
-    r'|\[INST\]'
-    r'|\[/INST\]'
-    r'|\[end\]',
-  );
-
-  /// Pattern that signals the model is hallucinating a new user turn — stop immediately.
-  static final _userTurnPattern = RegExp(
-    r'<\|user\|>|<\|im_start\|>\s*user|<start_of_turn>\s*user|\[INST\]',
-  );
-
-  /// Generate a streaming response.
-  /// [messages] is a list of {role, content} maps.
-  /// [systemPrompt] is prepended as a system message.
-  /// Returns a Stream of String tokens.
-  Stream<String> generate({
-    required List<Map<String, String>> messages,
-    String? systemPrompt,
-    double temperature = 0.7,
-  }) async* {
-    if (_engine == null || !isLoaded.value) {
-      throw StateError('No model loaded. Call loadModel() first.');
-    }
-    if (isGenerating.value) {
-      throw StateError('Another generation is already in progress.');
-    }
-
-    isGenerating.value = true;
-    tokensPerSecond.value = 0.0;
-    final stopwatch = Stopwatch()..start();
-    int tokenCount = 0;
-
-    // Buffer to detect multi-token stop sequences
-    String buffer = '';
-
-    try {
-      // Build the full prompt from messages
-      final prompt = _buildPrompt(messages, systemPrompt);
-
-      await for (final token in _engine!.generate(prompt)) {
-        tokenCount++;
-        if (stopwatch.elapsedMilliseconds > 0) {
-          tokensPerSecond.value =
-              tokenCount / (stopwatch.elapsedMilliseconds / 1000);
-        }
-
-        // Accumulate into buffer for stop-pattern detection
-        buffer += token;
-
-        // Check if model is hallucinating a user turn — stop immediately
-        if (_userTurnPattern.hasMatch(buffer)) {
-          final cleaned = buffer
-              .replaceAll(_stopPatterns, '')
-              .replaceAll(_userTurnPattern, '')
-              .trim();
-          if (cleaned.isNotEmpty) {
-            yield cleaned;
-          }
-          break;
-        }
-
-        // Check if buffer contains any stop pattern
-        if (_stopPatterns.hasMatch(buffer)) {
-          // Yield everything before the stop pattern, then stop
-          final cleaned = buffer.replaceAll(_stopPatterns, '').trim();
-          if (cleaned.isNotEmpty) {
-            yield cleaned;
-          }
-          break;
-        }
-
-        // If buffer is getting long enough that we know it's safe, flush it
-        // Keep last 30 chars to detect split stop sequences
-        if (buffer.length > 40) {
-          final safe = buffer.substring(0, buffer.length - 30);
-          buffer = buffer.substring(buffer.length - 30);
-          yield safe;
-        }
-      }
-
-      // Flush any remaining buffer (cleaning all control patterns)
-      if (buffer.isNotEmpty) {
-        final cleaned = buffer
-            .replaceAll(_stopPatterns, '')
-            .replaceAll(_userTurnPattern, '')
-            .trim();
-        if (cleaned.isNotEmpty) {
-          yield cleaned;
-        }
-      }
-    } finally {
-      stopwatch.stop();
-      lastGenerationTokens.value = tokenCount;
-      lastGenerationSpeed.value = tokensPerSecond.value;
-      isGenerating.value = false;
-    }
   }
 
   /// Generate a chat completion using llamadart's chat-template API.
@@ -383,6 +288,40 @@ class LlmService extends GetxService {
       lastGenerationTokens.value = tokenCount;
       lastGenerationSpeed.value = tokensPerSecond.value;
       isGenerating.value = false;
+    }
+  }
+
+  /// Load a multimodal projector (mmproj GGUF) alongside the current model
+  /// to enable image/audio understanding. Requires a model already loaded.
+  Future<void> loadMultimodalProjector(String mmprojPath) async {
+    if (_engine == null || !isLoaded.value) {
+      throw StateError('No model loaded. Call loadModel() first.');
+    }
+    await _engine!.loadMultimodalProjector(mmprojPath);
+  }
+
+  /// Unload the active multimodal projector, keeping the text model loaded.
+  Future<void> unloadMultimodalProjector() async {
+    await _engine?.unloadMultimodalProjector();
+  }
+
+  /// Whether the loaded model + projector combination supports image input.
+  Future<bool> get supportsVision async {
+    if (_engine == null || !isLoaded.value) return false;
+    try {
+      return await _engine!.supportsVision;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Whether the loaded model + projector combination supports audio input.
+  Future<bool> get supportsAudio async {
+    if (_engine == null || !isLoaded.value) return false;
+    try {
+      return await _engine!.supportsAudio;
+    } catch (_) {
+      return false;
     }
   }
 
@@ -429,31 +368,6 @@ class LlmService extends GetxService {
       final wakelockService = Get.find<WakelockService>();
       await wakelockService.disable();
     } catch (_) {}
-  }
-
-  /// Build a single prompt string from chat messages.
-  String _buildPrompt(
-    List<Map<String, String>> messages,
-    String? systemPrompt,
-  ) {
-    final buffer = StringBuffer();
-
-    if (systemPrompt != null && systemPrompt.isNotEmpty) {
-      buffer.writeln('<|system|>');
-      buffer.writeln(systemPrompt);
-      buffer.writeln('<|end|>');
-    }
-
-    for (final msg in messages) {
-      final role = msg['role'] ?? 'user';
-      final content = msg['content'] ?? '';
-      buffer.writeln('<|$role|>');
-      buffer.writeln(content);
-      buffer.writeln('<|end|>');
-    }
-
-    buffer.writeln('<|assistant|>');
-    return buffer.toString();
   }
 
   @override
