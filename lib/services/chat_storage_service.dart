@@ -107,4 +107,22 @@ class ChatStorageService extends GetxService {
       _settingsBox.get('backend_type', defaultValue: 'cpu') as String;
 
   set backendType(String value) => _settingsBox.put('backend_type', value);
+
+  // ── Long-term memory (Smart Recall) ───────────────────────────
+
+  /// Opt-in: off by default. Enabling costs an extra LLM pass per message
+  /// (extraction) plus a resident embedding model.
+  bool get smartRecallEnabled =>
+      _settingsBox.get('smart_recall_enabled', defaultValue: false) as bool;
+
+  set smartRecallEnabled(bool value) =>
+      _settingsBox.put('smart_recall_enabled', value);
+
+  /// Absolute path of the GGUF model tagged for embedding use. Empty when
+  /// none has been selected yet.
+  String get embeddingModelPath =>
+      _settingsBox.get('embedding_model_path', defaultValue: '') as String;
+
+  set embeddingModelPath(String value) =>
+      _settingsBox.put('embedding_model_path', value);
 }

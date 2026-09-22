@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
+import 'package:path/path.dart' as p;
 
 import '../theme/app_colors.dart';
 import '../controllers/chat_controller.dart';
@@ -10,6 +11,7 @@ import '../services/local_api_server_service.dart';
 import '../services/model_manager.dart';
 import '../services/background_optimizer_service.dart';
 import '../services/chat_storage_service.dart';
+import '../services/embedding_service.dart';
 
 class SettingsScreen extends StatelessWidget {
   /// When true, no Scaffold — just the body content for embedding in tabs.
@@ -533,6 +535,21 @@ class _SettingsBody extends StatelessWidget {
 
               const SizedBox(height: 28),
 
+              // ── Smart Recall ──────────────────────────────
+              _sectionHeader(context, 'Smart Recall'),
+              const SizedBox(height: 8),
+              Text(
+                'Cross-chat long-term memory — durable facts get remembered '
+                'and recalled in any future conversation. Off by default: '
+                'costs extra battery/time per message and keeps a small '
+                'embedding model resident.',
+                style: TextStyle(fontSize: 12, color: context.textD),
+              ),
+              const SizedBox(height: 12),
+              _SmartRecallCard(storage: storage),
+
+              const SizedBox(height: 28),
+
               // ── Storage ───────────────────────────────────
               _sectionHeader(context, 'Storage'),
               const SizedBox(height: 12),
@@ -1044,3 +1061,197 @@ class _HardwareSettingsCardState extends State<_HardwareSettingsCard> {
   }
 }
 
+
+class _SmartRecallCard extends StatefulWidget {
+  final ChatStorageService storage;
+
+  const _SmartRecallCard({required this.storage});
+
+  @override
+  State<_SmartRecallCard> createState() => _SmartRecallCardState();
+}
+
+class _SmartRecallCardState extends State<_SmartRecallCard> {
+  late bool _enabled = widget.storage.smartRecallEnabled;
+
+  Future<void> _toggle(bool value) async {
+    setState(() => _enabled = value);
+    widget.storage.smartRecallEnabled = value;
+    if (!value) return;
+
+    final path = widget.storage.embeddingModelPath;
+    if (path.isEmpty) {
+      Get.snackbar(
+        'Choose an Embedding Model',
+        'Pick a downloaded model below to power Smart Recall.',
+        snackPosition: SnackPosition.BOTTOM,
+      );
+      return;
+    }
+
+    final embedder = Get.find<EmbeddingService>();
+    if (embedder.isLoaded.value) return;
+    try {
+      await embedder.load(path);
+    } catch (e) {
+      Get.snackbar(
+        'Embedding Model Error',
+        e.toString(),
+        snackPosition: SnackPosition.BOTTOM,
+      );
+    }
+  }
+
+  Future<void> _pickModel(BuildContext context) async {
+    final manager = Get.find<ModelManager>();
+    final files = manager.downloadedModels.toList();
+    if (files.isEmpty) {
+      Get.snackbar(
+        'No Models Downloaded',
+        'Download or import a small embedding model (e.g. a GGUF build of '
+            'nomic-embed-text) in Models first.',
+        snackPosition: SnackPosition.BOTTOM,
+      );
+      return;
+    }
+
+    final chosen = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: context.bg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: files
+              .map(
+                (f) => ListTile(
+                  leading: Icon(Icons.memory_rounded, color: context.textM),
+                  title: Text(
+                    f,
+                    style: TextStyle(color: context.text, fontSize: 13),
+                  ),
+                  onTap: () => Navigator.pop(sheetContext, f),
+                ),
+              )
+              .toList(),
+        ),
+      ),
+    );
+
+    if (chosen == null) return;
+    final path = manager.getModelPathByFilename(chosen);
+    widget.storage.embeddingModelPath = path;
+
+    final embedder = Get.find<EmbeddingService>();
+    try {
+      await embedder.load(path);
+      if (mounted) {
+        Get.snackbar(
+          'Embedding Model Loaded',
+          chosen,
+          snackPosition: SnackPosition.BOTTOM,
+        );
+      }
+    } catch (e) {
+      Get.snackbar(
+        'Embedding Model Error',
+        e.toString(),
+        snackPosition: SnackPosition.BOTTOM,
+      );
+    }
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final embedder = Get.find<EmbeddingService>();
+    final path = widget.storage.embeddingModelPath;
+    final selectedName = path.isEmpty ? null : p.basename(path);
+
+    return Container(
+      decoration: BoxDecoration(
+        color: context.bgPanel,
+        border: Border.all(color: context.border),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SwitchListTile(
+              title: Text(
+                'Smart Recall',
+                style: TextStyle(color: context.text, fontSize: 14),
+              ),
+              subtitle: Text(
+                'Remember durable facts about you across every chat, forever.',
+                style: TextStyle(color: context.textD, fontSize: 12),
+              ),
+              secondary: Icon(
+                Icons.psychology_alt_rounded,
+                color: _enabled ? AppColors.accent : context.textM,
+              ),
+              value: _enabled,
+              onChanged: _toggle,
+              activeThumbColor: AppColors.accent,
+              contentPadding: EdgeInsets.zero,
+            ),
+            const SizedBox(height: 8),
+            Obx(() {
+              final loaded = embedder.isLoaded.value;
+              final loading = embedder.isLoading.value;
+              final statusText = loading
+                  ? 'Loading embedding model…'
+                  : loaded
+                  ? 'Ready: ${p.basename(embedder.loadedModelPath.value)}'
+                  : selectedName != null
+                  ? '$selectedName selected, not loaded'
+                  : 'No embedding model selected';
+              final statusColor = loaded
+                  ? AppColors.green
+                  : (loading ? AppColors.orange : context.textD);
+              return Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      statusText,
+                      style: TextStyle(
+                        color: statusColor,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () => _pickModel(context),
+                    child: const Text('Choose Model'),
+                  ),
+                ],
+              );
+            }),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () => Get.toNamed('/memories'),
+                icon: const Icon(Icons.psychology_rounded, size: 18),
+                label: const Text('Manage Memories'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: context.text,
+                  side: BorderSide(color: context.border),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

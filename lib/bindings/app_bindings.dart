@@ -7,6 +7,8 @@ import '../services/local_api_server_service.dart';
 import '../services/wakelock_service.dart';
 import '../services/log_service.dart';
 import '../services/conversation_memory_service.dart';
+import '../services/embedding_service.dart';
+import '../services/memory_service.dart';
 import '../controllers/chat_controller.dart';
 import '../controllers/model_controller.dart';
 import '../controllers/theme_controller.dart';
@@ -23,6 +25,8 @@ class AppBindings extends Bindings {
     Get.lazyPut(() => WakelockService(), fenix: true);
     Get.lazyPut(() => LogService(), fenix: true);
     Get.lazyPut(() => ConversationMemoryService(), fenix: true);
+    Get.lazyPut(() => EmbeddingService(), fenix: true);
+    Get.lazyPut(() => MemoryService(), fenix: true);
 
     // ── Controllers ──────────────────────────────────────────────
     Get.put(

@@ -10,6 +10,8 @@ import '../services/local_api_server_service.dart';
 import '../services/wakelock_service.dart';
 import '../services/log_service.dart';
 import '../services/background_optimizer_service.dart';
+import '../services/embedding_service.dart';
+import '../services/memory_service.dart';
 import '../routes/app_routes.dart';
 
 class SplashScreen extends StatefulWidget {
@@ -48,6 +50,19 @@ class _SplashScreenState extends State<SplashScreen> {
       setState(() => _status = 'Preparing local API...');
       log.info('Preparing local API...', source: 'Splash');
       await Get.find<LocalApiServerService>().init();
+
+      setState(() => _status = 'Preparing memory...');
+      log.info('Preparing memory...', source: 'Splash');
+      final storage = Get.find<ChatStorageService>();
+      await Get.find<MemoryService>().init();
+      if (storage.smartRecallEnabled && storage.embeddingModelPath.isNotEmpty) {
+        try {
+          await Get.find<EmbeddingService>().load(storage.embeddingModelPath);
+        } catch (e) {
+          // Smart Recall degrades to disabled rather than blocking startup.
+          log.warn('Embedding model failed to load: $e', source: 'Splash');
+        }
+      }
 
       setState(() => _status = 'Setting up background services...');
       log.info('Setting up background services...', source: 'Splash');

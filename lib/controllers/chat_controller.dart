@@ -6,11 +6,14 @@ import '../models/message_model.dart';
 import '../services/llm_service.dart';
 import '../services/chat_storage_service.dart';
 import '../services/conversation_memory_service.dart';
+import '../services/memory_service.dart';
 
 class ChatController extends GetxController {
   final LlmService _llm = Get.find<LlmService>();
   final ChatStorageService _storage = Get.find<ChatStorageService>();
-  final ConversationMemoryService _memory = Get.find<ConversationMemoryService>();
+  final ConversationMemoryService _contextWindow =
+      Get.find<ConversationMemoryService>();
+  final MemoryService _longTermMemory = Get.find<MemoryService>();
 
   final chats = <ChatModel>[].obs;
   final activeChatId = RxnString();
@@ -91,16 +94,35 @@ class ChatController extends GetxController {
     _storage.saveChat(chat);
     chats.refresh();
 
+    var effectiveSystemPrompt = chat.systemPrompt.isNotEmpty
+        ? chat.systemPrompt
+        : systemPrompt.value;
+
+    // Cross-chat long-term memory recall (opt-in; no-op unless Smart Recall
+    // is enabled and an embedding model is loaded). Injected as a labeled
+    // block in the system prompt so it flows through the same context-window
+    // budget as everything else below.
+    final recalled = await _longTermMemory.recall(text.trim());
+    if (recalled.isNotEmpty) {
+      final block = StringBuffer(
+        'Long-term memory — things you remember about the user from '
+        'earlier conversations (use only if relevant):\n',
+      );
+      for (final m in recalled) {
+        final date = m.eventDate ?? m.createdAt;
+        block.writeln('- (${date.year}-${date.month.toString().padLeft(2, '0')}-'
+            '${date.day.toString().padLeft(2, '0')}) ${m.text}');
+      }
+      effectiveSystemPrompt = '$effectiveSystemPrompt\n\n${block.toString().trim()}';
+    }
+
     // Build message history for the LLM, trimmed to fit the active model's
     // context window (newest turns kept, oldest dropped first — see
     // ConversationMemoryService). The full history stays persisted in Hive
     // regardless of what gets sent to the model.
-    final effectiveSystemPrompt = chat.systemPrompt.isNotEmpty
-        ? chat.systemPrompt
-        : systemPrompt.value;
     final candidateMessages =
         chat.messages.where((m) => !m.isSystem).toList();
-    final fittedMessages = await _memory.fitToContext(
+    final fittedMessages = await _contextWindow.fitToContext(
       candidateMessages,
       systemPrompt: effectiveSystemPrompt,
     );
@@ -140,12 +162,22 @@ class ChatController extends GetxController {
             r'|<\|pad\|>|</s>|<s>|\[INST\]|\[/INST\]|\[end\]'
           ), '')
           .trim();
-      isGenerating.value = false;
       streamedResponse.value = '';
       chat.updatedAt = DateTime.now();
       _storage.saveChat(chat);
       chats.refresh();
     }
+
+    // Best-effort long-term memory extraction, run while isGenerating is
+    // still true: it makes its own call into LlmService.generate(), and
+    // that call rejects if one is already in flight, so this has to finish
+    // before the UI can trigger another send.
+    await _longTermMemory.extractAndStore(
+      chat: chat,
+      userMessage: userMsg,
+      assistantMessage: aiMsg,
+    );
+    isGenerating.value = false;
   }
 
   /// Stop current generation.

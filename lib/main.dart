@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'models/chat_model.dart';
 import 'models/message_model.dart';
+import 'models/memory_entry.dart';
 import 'theme/app_theme.dart';
 import 'bindings/app_bindings.dart';
 import 'controllers/theme_controller.dart';
@@ -40,11 +41,13 @@ Future<void> main() async {
     Hive.registerAdapter(ChatModelAdapter());
     Hive.registerAdapter(MessageModelAdapter());
     Hive.registerAdapter(MessageRoleAdapter());
+    Hive.registerAdapter(MemoryEntryAdapter());
 
     // Open Hive boxes
     await Hive.openBox<ChatModel>('chats');
     await Hive.openBox('settings');
     await Hive.openBox('models_meta');
+    await Hive.openBox<MemoryEntry>('memories');
 
     // Load theme preference
     final themeController = Get.put(ThemeController());

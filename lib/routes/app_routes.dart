@@ -6,6 +6,7 @@ import '../screens/model_library_screen.dart';
 import '../screens/settings_screen.dart';
 import '../screens/api_endpoints_screen.dart';
 import '../screens/logs_screen.dart';
+import '../screens/memories_screen.dart';
 
 class AppRoutes {
   static const splash = '/splash';
@@ -14,6 +15,7 @@ class AppRoutes {
   static const settings = '/settings';
   static const apiEndpoints = '/api-endpoints';
   static const logs = '/logs';
+  static const memories = '/memories';
 
   static final pages = [
     GetPage(name: splash, page: () => const SplashScreen()),
@@ -36,6 +38,11 @@ class AppRoutes {
     GetPage(
       name: logs,
       page: () => const LogsScreen(),
+      transition: Transition.rightToLeft,
+    ),
+    GetPage(
+      name: memories,
+      page: () => const MemoriesScreen(),
       transition: Transition.rightToLeft,
     ),
   ];
