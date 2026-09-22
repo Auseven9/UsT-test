@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:hive/hive.dart';
 import 'package:llamadart/llamadart.dart';
 
@@ -48,6 +50,17 @@ class MessageModel extends HiveObject {
       MessageRole.assistant => LlamaChatRole.assistant,
       MessageRole.system => LlamaChatRole.system,
     };
+
+    if (imageBase64 != null && imageBase64!.isNotEmpty) {
+      return LlamaChatMessage.withContent(
+        role: chatRole,
+        content: [
+          if (content.isNotEmpty) LlamaTextContent(content),
+          LlamaImageContent(bytes: base64Decode(imageBase64!)),
+        ],
+      );
+    }
+
     return LlamaChatMessage.fromText(role: chatRole, text: content);
   }
 }

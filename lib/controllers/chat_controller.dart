@@ -71,13 +71,30 @@ class ChatController extends GetxController {
   }
 
   /// Send a user message and stream AI response.
-  Future<void> sendMessage(String text, {String? modelFilename}) async {
-    if (text.trim().isEmpty) return;
+  ///
+  /// [imageBase64]/[imageMimeType] attach an image (persisted with the
+  /// message, requires a loaded multimodal projector to actually be seen
+  /// by the model). [audioPath] attaches a local audio file for this turn
+  /// only — audio isn't persisted to chat history, unlike images.
+  Future<void> sendMessage(
+    String text, {
+    String? modelFilename,
+    String? imageBase64,
+    String? imageMimeType,
+    String? audioPath,
+  }) async {
+    final hasAttachment = imageBase64 != null || audioPath != null;
+    if (text.trim().isEmpty && !hasAttachment) return;
     final chat = activeChat;
     if (chat == null) return;
 
     // Add user message
-    final userMsg = MessageModel(role: MessageRole.user, content: text.trim());
+    final userMsg = MessageModel(
+      role: MessageRole.user,
+      content: text.trim(),
+      imageBase64: imageBase64,
+      imageMimeType: imageMimeType,
+    );
     chat.messages.add(userMsg);
     chat.autoTitle();
     chat.updatedAt = DateTime.now();
@@ -96,6 +113,17 @@ class ChatController extends GetxController {
         ? chat.systemPrompt
         : systemPrompt.value;
     final messages = await _buildBoundedMessages(chat, effectiveSystemPrompt);
+    if (audioPath != null && messages.isNotEmpty) {
+      // Audio isn't persisted (see MessageModel), so it's injected here,
+      // for this turn only, rather than round-tripped through history.
+      final last = messages.removeLast();
+      messages.add(
+        LlamaChatMessage.withContent(
+          role: last.role,
+          content: [...last.parts, LlamaAudioContent(path: audioPath)],
+        ),
+      );
+    }
     final replyBudget = _replyTokenBudget;
 
     // Start generation
@@ -141,10 +169,11 @@ class ChatController extends GetxController {
   }
 
   /// Tokens reserved for the model's reply, taken out of the context
-  /// budget before history is packed in. Scales with context size since
-  /// Android runs a much smaller context (1024) than desktop (2048).
+  /// budget before history is packed in. Scales with context size — the
+  /// user can now set context size freely (see ChatStorageService), so
+  /// this isn't capped tightly to what only fit the old fixed 2048 max.
   int get _replyTokenBudget =>
-      (_llm.contextSize * 0.25).round().clamp(128, 512);
+      (_llm.contextSize * 0.25).round().clamp(128, 2048);
 
   /// Build the message list sent to the model, dropping the oldest turns
   /// once they no longer fit in the context window. The system prompt and

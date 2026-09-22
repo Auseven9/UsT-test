@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:get/get.dart';
 import 'package:hive/hive.dart';
 
@@ -107,4 +109,26 @@ class ChatStorageService extends GetxService {
       _settingsBox.get('backend_type', defaultValue: 'cpu') as String;
 
   set backendType(String value) => _settingsBox.put('backend_type', value);
+
+  // ── Context Window ──────────────────────────────────────────
+
+  /// User-configurable context size (n_ctx), in tokens. Not capped by the
+  /// app beyond a sane default — larger values use more RAM/VRAM and can
+  /// trigger the OS low-memory killer on phones, so the UI should warn.
+  int get contextSize {
+    final stored = _settingsBox.get('context_size') as num?;
+    if (stored != null && stored > 0) return stored.toInt();
+    return Platform.isAndroid ? 1024 : 2048;
+  }
+
+  set contextSize(int value) => _settingsBox.put('context_size', value);
+
+  // ── Multimodal (Vision / Audio) ─────────────────────────────
+
+  /// Path to an optional multimodal projector (mmproj) GGUF file. When set
+  /// and the file exists, it's loaded alongside the main model to enable
+  /// image/audio understanding for compatible models.
+  String get mmprojPath => _settingsBox.get('mmproj_path', defaultValue: '') as String;
+
+  set mmprojPath(String value) => _settingsBox.put('mmproj_path', value);
 }

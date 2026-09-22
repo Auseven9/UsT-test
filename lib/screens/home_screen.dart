@@ -1,3 +1,7 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 
@@ -29,6 +33,13 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _sidebarOpen = true;
   bool _autoScrollToBottom = true;
   String? _lastRenderedChatId;
+
+  // Staged attachments for the next outgoing message.
+  Uint8List? _pendingImageBytes;
+  String? _pendingImageMimeType;
+  String? _pendingImageName;
+  String? _pendingAudioPath;
+  String? _pendingAudioName;
 
   // Mobile bottom nav index: 0=Chat, 1=Models, 2=Settings
   int _mobileTabIndex = 0;
@@ -79,7 +90,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _send() {
     final text = _msgController.text.trim();
-    if (text.isEmpty) return;
+    final hasAttachment = _pendingImageBytes != null || _pendingAudioPath != null;
+    if (text.isEmpty && !hasAttachment) return;
 
     if (_chatCtrl.activeChat == null) {
       _chatCtrl.newChat();
@@ -90,8 +102,85 @@ class _HomeScreenState extends State<HomeScreen> {
     _chatCtrl.sendMessage(
       text,
       modelFilename: _modelCtrl.selectedModelFilename.value,
+      imageBase64: _pendingImageBytes != null
+          ? base64Encode(_pendingImageBytes!)
+          : null,
+      imageMimeType: _pendingImageMimeType,
+      audioPath: _pendingAudioPath,
     );
+    setState(() {
+      _pendingImageBytes = null;
+      _pendingImageMimeType = null;
+      _pendingImageName = null;
+      _pendingAudioPath = null;
+      _pendingAudioName = null;
+    });
     _scrollToBottom(force: true);
+  }
+
+  String? _mimeTypeForExtension(String? extension) {
+    switch (extension?.toLowerCase()) {
+      case 'png':
+        return 'image/png';
+      case 'jpg':
+      case 'jpeg':
+        return 'image/jpeg';
+      case 'webp':
+        return 'image/webp';
+      case 'gif':
+        return 'image/gif';
+      default:
+        return null;
+    }
+  }
+
+  Future<void> _pickImage() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.image,
+        withData: true,
+      );
+      if (result == null || result.files.isEmpty) return;
+      final file = result.files.single;
+      if (file.bytes == null) return;
+      setState(() {
+        _pendingImageBytes = file.bytes;
+        _pendingImageMimeType = _mimeTypeForExtension(file.extension);
+        _pendingImageName = file.name;
+        _pendingAudioPath = null;
+        _pendingAudioName = null;
+      });
+    } catch (e) {
+      Get.snackbar('Error', e.toString(), snackPosition: SnackPosition.BOTTOM);
+    }
+  }
+
+  Future<void> _pickAudio() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(type: FileType.audio);
+      if (result == null || result.files.isEmpty) return;
+      final file = result.files.single;
+      if (file.path == null) return;
+      setState(() {
+        _pendingAudioPath = file.path;
+        _pendingAudioName = file.name;
+        _pendingImageBytes = null;
+        _pendingImageMimeType = null;
+        _pendingImageName = null;
+      });
+    } catch (e) {
+      Get.snackbar('Error', e.toString(), snackPosition: SnackPosition.BOTTOM);
+    }
+  }
+
+  void _clearAttachment() {
+    setState(() {
+      _pendingImageBytes = null;
+      _pendingImageMimeType = null;
+      _pendingImageName = null;
+      _pendingAudioPath = null;
+      _pendingAudioName = null;
+    });
   }
 
   @override
@@ -1038,70 +1127,144 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildInputArea() {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+  Widget _buildAttachmentChip() {
+    final hasImage = _pendingImageBytes != null;
+    final hasAudio = _pendingAudioPath != null;
+    if (!hasImage && !hasAudio) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
       child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         decoration: BoxDecoration(
           color: context.bgInput,
           border: Border.all(color: context.border),
-          borderRadius: BorderRadius.circular(24),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(context.isDark ? 0.15 : 0.04),
-              blurRadius: 8,
-              offset: const Offset(0, 2),
-            ),
-          ],
+          borderRadius: BorderRadius.circular(12),
         ),
         child: Row(
-          crossAxisAlignment: CrossAxisAlignment.end,
           children: [
-            // Text field
+            if (hasImage) ...[
+              ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: Image.memory(
+                  _pendingImageBytes!,
+                  width: 32,
+                  height: 32,
+                  fit: BoxFit.cover,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Icon(Icons.image_rounded, size: 14, color: context.textD),
+            ] else ...[
+              Icon(Icons.mic_rounded, size: 16, color: context.textD),
+            ],
+            const SizedBox(width: 6),
             Expanded(
-              child: TextField(
-                controller: _msgController,
-                maxLines: 5,
-                minLines: 1,
-                textInputAction: TextInputAction.newline,
-                style: TextStyle(
-                  fontSize: 15,
-                  color: context.text,
-                  height: 1.4,
-                ),
-                decoration: InputDecoration(
-                  hintText: 'Ask anything...',
-                  hintStyle: TextStyle(color: context.textD),
-                  border: InputBorder.none,
-                  enabledBorder: InputBorder.none,
-                  focusedBorder: InputBorder.none,
-                  contentPadding: const EdgeInsets.fromLTRB(24, 14, 8, 14),
-                ),
-                onSubmitted: (_) => _send(),
+              child: Text(
+                (hasImage ? _pendingImageName : _pendingAudioName) ?? 'Attachment',
+                style: TextStyle(fontSize: 12, color: context.textM),
+                overflow: TextOverflow.ellipsis,
               ),
             ),
-
-            // Send / Stop
-            Padding(
-              padding: const EdgeInsets.only(right: 8, bottom: 6),
-              child: Obx(
-                () => _chatCtrl.isGenerating.value
-                    ? _circleButton(
-                        icon: Icons.stop_rounded,
-                        color: AppColors.red,
-                        onTap: _chatCtrl.stopGeneration,
-                        tooltip: 'Stop',
-                      )
-                    : _circleButton(
-                        icon: Icons.arrow_upward_rounded,
-                        color: AppColors.accent,
-                        onTap: _send,
-                        tooltip: 'Send',
-                      ),
-              ),
+            InkWell(
+              onTap: _clearAttachment,
+              borderRadius: BorderRadius.circular(12),
+              child: Icon(Icons.close_rounded, size: 16, color: context.textD),
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildInputArea() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _buildAttachmentChip(),
+          Container(
+            decoration: BoxDecoration(
+              color: context.bgInput,
+              border: Border.all(color: context.border),
+              borderRadius: BorderRadius.circular(24),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(context.isDark ? 0.15 : 0.04),
+                  blurRadius: 8,
+                  offset: const Offset(0, 2),
+                ),
+              ],
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                // Attach: image
+                Padding(
+                  padding: const EdgeInsets.only(left: 4, bottom: 6),
+                  child: IconButton(
+                    icon: Icon(Icons.image_outlined, size: 20, color: context.textD),
+                    tooltip: 'Attach image',
+                    onPressed: _pickImage,
+                  ),
+                ),
+                // Attach: audio
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: IconButton(
+                    icon: Icon(Icons.mic_none_rounded, size: 20, color: context.textD),
+                    tooltip: 'Attach audio file',
+                    onPressed: _pickAudio,
+                  ),
+                ),
+                // Text field
+                Expanded(
+                  child: TextField(
+                    controller: _msgController,
+                    maxLines: 5,
+                    minLines: 1,
+                    textInputAction: TextInputAction.newline,
+                    style: TextStyle(
+                      fontSize: 15,
+                      color: context.text,
+                      height: 1.4,
+                    ),
+                    decoration: InputDecoration(
+                      hintText: 'Ask anything...',
+                      hintStyle: TextStyle(color: context.textD),
+                      border: InputBorder.none,
+                      enabledBorder: InputBorder.none,
+                      focusedBorder: InputBorder.none,
+                      contentPadding: const EdgeInsets.fromLTRB(24, 14, 8, 14),
+                    ),
+                    onSubmitted: (_) => _send(),
+                  ),
+                ),
+
+                // Send / Stop
+                Padding(
+                  padding: const EdgeInsets.only(right: 8, bottom: 6),
+                  child: Obx(
+                    () => _chatCtrl.isGenerating.value
+                        ? _circleButton(
+                            icon: Icons.stop_rounded,
+                            color: AppColors.red,
+                            onTap: _chatCtrl.stopGeneration,
+                            tooltip: 'Stop',
+                          )
+                        : _circleButton(
+                            icon: Icons.arrow_upward_rounded,
+                            color: AppColors.accent,
+                            onTap: _send,
+                            tooltip: 'Send',
+                          ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

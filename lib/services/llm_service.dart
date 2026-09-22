@@ -152,14 +152,14 @@ class LlmService extends GetxService {
         return;
       }
 
-      // Use smaller context on Android to prevent OOM kills.
-      // Desktop can handle 2048, but Android devices with limited RAM
-      // need 1024 to avoid the Low Memory Killer (LMK).
-      final contextSize = Platform.isAndroid ? 1024 : 2048;
-      _contextSize = contextSize;
-
       // Map the string backend to GpuBackend enum
       final storage = Get.find<ChatStorageService>();
+
+      // Context size is user-configurable (see ChatStorageService.contextSize).
+      // Default is still conservative on Android (1024) vs desktop (2048) to
+      // avoid the Low Memory Killer, but the user can raise it deliberately.
+      final contextSize = storage.contextSize;
+      _contextSize = contextSize;
       GpuBackend parsedBackend;
       switch (storage.backendType) {
         case 'vulkan':
@@ -201,6 +201,18 @@ class LlmService extends GetxService {
       isLoaded.value = true;
       loadedModelPath.value = path;
       log?.info('Model loaded successfully: $filename', source: 'LLM');
+
+      // Best-effort: load the user-configured multimodal projector (mmproj)
+      // for vision/audio input, if one is set and the file still exists.
+      // Failure here must not fail the (already-successful) text model load.
+      final mmprojPath = storage.mmprojPath;
+      if (mmprojPath.isNotEmpty && await File(mmprojPath).exists()) {
+        try {
+          await loadMultimodalProjector(mmprojPath);
+        } catch (e) {
+          log?.error('Multimodal projector load failed: $e', source: 'LLM');
+        }
+      }
 
       // Enable wake lock for inference on mobile (keeps app from being killed)
       final modelName = p.basenameWithoutExtension(path);
@@ -276,6 +288,40 @@ class LlmService extends GetxService {
       lastGenerationTokens.value = tokenCount;
       lastGenerationSpeed.value = tokensPerSecond.value;
       isGenerating.value = false;
+    }
+  }
+
+  /// Load a multimodal projector (mmproj GGUF) alongside the current model
+  /// to enable image/audio understanding. Requires a model already loaded.
+  Future<void> loadMultimodalProjector(String mmprojPath) async {
+    if (_engine == null || !isLoaded.value) {
+      throw StateError('No model loaded. Call loadModel() first.');
+    }
+    await _engine!.loadMultimodalProjector(mmprojPath);
+  }
+
+  /// Unload the active multimodal projector, keeping the text model loaded.
+  Future<void> unloadMultimodalProjector() async {
+    await _engine?.unloadMultimodalProjector();
+  }
+
+  /// Whether the loaded model + projector combination supports image input.
+  Future<bool> get supportsVision async {
+    if (_engine == null || !isLoaded.value) return false;
+    try {
+      return await _engine!.supportsVision;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Whether the loaded model + projector combination supports audio input.
+  Future<bool> get supportsAudio async {
+    if (_engine == null || !isLoaded.value) return false;
+    try {
+      return await _engine!.supportsAudio;
+    } catch (_) {
+      return false;
     }
   }
 

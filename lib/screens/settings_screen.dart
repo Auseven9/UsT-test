@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 
@@ -6,6 +7,7 @@ import '../theme/app_colors.dart';
 import '../controllers/chat_controller.dart';
 import '../controllers/theme_controller.dart';
 import '../controllers/model_controller.dart';
+import '../services/llm_service.dart';
 import '../services/local_api_server_service.dart';
 import '../services/model_manager.dart';
 import '../services/background_optimizer_service.dart';
@@ -281,6 +283,13 @@ class _SettingsBody extends StatelessWidget {
               _sectionHeader(context, 'Hardware Configuration'),
               const SizedBox(height: 8),
               _HardwareSettingsCard(storage: storage),
+
+              const SizedBox(height: 28),
+
+              // ── Vision & Audio ──────────────────────────
+              _sectionHeader(context, 'Vision & Audio'),
+              const SizedBox(height: 8),
+              _MultimodalSettingsCard(storage: storage),
 
               const SizedBox(height: 28),
 
@@ -769,7 +778,18 @@ class _HardwareSettingsCard extends StatefulWidget {
 class _HardwareSettingsCardState extends State<_HardwareSettingsCard> {
   late String _backend;
   late double _gpuLayers;
+  late int _contextSize;
   bool _showManual = false;
+
+  static const List<int> _contextSizePresets = [
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+  ];
 
   // Auto-detect the best backend and GPU layers for this device
   static Map<String, dynamic> _detectBestConfig() {
@@ -810,6 +830,12 @@ class _HardwareSettingsCardState extends State<_HardwareSettingsCard> {
     super.initState();
     _backend = widget.storage.backendType;
     _gpuLayers = widget.storage.gpuLayers.toDouble();
+    _contextSize = widget.storage.contextSize;
+  }
+
+  void _saveContextSize(int value) {
+    setState(() => _contextSize = value);
+    widget.storage.contextSize = value;
   }
 
   void _applyAutoConfig() {
@@ -1006,6 +1032,69 @@ class _HardwareSettingsCardState extends State<_HardwareSettingsCard> {
               'If the app crashes when loading a model, reduce GPU layers or switch to CPU. Reload the model after changing settings.',
               style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
             ),
+            const SizedBox(height: 20),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  'Context Size',
+                  style: TextStyle(color: context.text, fontSize: 14),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: context.bgInput,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    _contextSize >= 1024
+                        ? '${(_contextSize / 1024).toStringAsFixed(_contextSize % 1024 == 0 ? 0 : 1)}K'
+                        : '$_contextSize',
+                    style: TextStyle(color: context.text, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: _contextSizePresets.map((size) {
+                final selected = _contextSize == size;
+                final label = size >= 1024 ? '${size ~/ 1024}K' : '$size';
+                return InkWell(
+                  onTap: () => _saveContextSize(size),
+                  borderRadius: BorderRadius.circular(8),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: selected ? AppColors.accent : context.bgInput,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: selected ? AppColors.accent : context.border,
+                      ),
+                    ),
+                    child: Text(
+                      label,
+                      style: TextStyle(
+                        color: selected ? Colors.white : context.text,
+                        fontSize: 12,
+                        fontWeight: selected ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'This is no longer capped by the app — pick what your device can '
+              'handle. Larger context lets the model remember more of the '
+              'conversation, but uses substantially more RAM/VRAM and can '
+              'trigger the OS low-memory killer on phones. Reload the model '
+              'after changing this.',
+              style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+            ),
           ],
         ],
       ),
@@ -1038,6 +1127,169 @@ class _HardwareSettingsCardState extends State<_HardwareSettingsCard> {
               textAlign: TextAlign.center,
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MultimodalSettingsCard extends StatefulWidget {
+  final ChatStorageService storage;
+
+  const _MultimodalSettingsCard({required this.storage});
+
+  @override
+  State<_MultimodalSettingsCard> createState() =>
+      _MultimodalSettingsCardState();
+}
+
+class _MultimodalSettingsCardState extends State<_MultimodalSettingsCard> {
+  late String _mmprojPath;
+
+  @override
+  void initState() {
+    super.initState();
+    _mmprojPath = widget.storage.mmprojPath;
+  }
+
+  Future<void> _pickMmproj() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(type: FileType.any);
+      if (result == null || result.files.isEmpty) return;
+      final path = result.files.single.path;
+      if (path == null || !path.toLowerCase().endsWith('.gguf')) {
+        Get.snackbar(
+          'Invalid File',
+          'Please select a multimodal projector (mmproj) .gguf file.',
+          snackPosition: SnackPosition.BOTTOM,
+        );
+        return;
+      }
+      setState(() => _mmprojPath = path);
+      widget.storage.mmprojPath = path;
+      Get.snackbar(
+        'Projector Set',
+        'Reload the model to enable vision/audio input.',
+        snackPosition: SnackPosition.BOTTOM,
+      );
+    } catch (e) {
+      Get.snackbar('Error', e.toString(), snackPosition: SnackPosition.BOTTOM);
+    }
+  }
+
+  void _clearMmproj() {
+    setState(() => _mmprojPath = '');
+    widget.storage.mmprojPath = '';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final llm = Get.find<LlmService>();
+
+    return Container(
+      decoration: BoxDecoration(
+        color: context.bgPanel,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: context.border),
+      ),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.image_rounded, size: 18, color: AppColors.accent),
+              const SizedBox(width: 8),
+              Text(
+                'Multimodal Projector',
+                style: TextStyle(color: context.text, fontSize: 15, fontWeight: FontWeight.w600),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Load an mmproj GGUF file matching your model to enable image '
+            'and audio attachments in chat. Not every model ships one — '
+            'check the model source for a matching mmproj download.',
+            style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+          ),
+          const SizedBox(height: 12),
+          if (_mmprojPath.isNotEmpty)
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: context.bgInput,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.check_circle_rounded, size: 16, color: AppColors.accent),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _mmprojPath.split(Platform.pathSeparator).last,
+                      style: TextStyle(color: context.text, fontSize: 12),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  InkWell(
+                    onTap: _clearMmproj,
+                    child: Icon(Icons.close_rounded, size: 16, color: context.textD),
+                  ),
+                ],
+              ),
+            )
+          else
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: _pickMmproj,
+                icon: const Icon(Icons.upload_file_rounded, size: 16),
+                label: const Text('Select mmproj File'),
+              ),
+            ),
+          const SizedBox(height: 10),
+          Obx(() {
+            if (!llm.isLoaded.value) {
+              return Text(
+                'Load a model to check vision/audio support.',
+                style: TextStyle(color: context.textD, fontSize: 11),
+              );
+            }
+            return FutureBuilder<List<bool>>(
+              future: Future.wait([llm.supportsVision, llm.supportsAudio]),
+              builder: (_, snapshot) {
+                if (!snapshot.hasData) return const SizedBox.shrink();
+                final vision = snapshot.data![0];
+                final audio = snapshot.data![1];
+                return Row(
+                  children: [
+                    _capabilityChip(context, 'Vision', vision),
+                    const SizedBox(width: 8),
+                    _capabilityChip(context, 'Audio', audio),
+                  ],
+                );
+              },
+            );
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _capabilityChip(BuildContext context, String label, bool enabled) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: enabled ? AppColors.accent.withValues(alpha: 0.12) : context.bgInput,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        enabled ? '✓ $label' : '✕ $label',
+        style: TextStyle(
+          color: enabled ? AppColors.accent : context.textD,
+          fontSize: 11,
+          fontWeight: FontWeight.w600,
         ),
       ),
     );

@@ -44,7 +44,11 @@ class ChatModel extends HiveObject {
     final firstUserMsg = messages.where((m) => m.isUser).firstOrNull;
     if (firstUserMsg != null) {
       final raw = firstUserMsg.content.trim();
-      title = raw.length > 40 ? '${raw.substring(0, 40)}…' : raw;
+      if (raw.isEmpty) {
+        title = firstUserMsg.imageBase64 != null ? 'Image' : title;
+      } else {
+        title = raw.length > 40 ? '${raw.substring(0, 40)}…' : raw;
+      }
     }
   }
 }
