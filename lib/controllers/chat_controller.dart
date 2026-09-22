@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:get/get.dart';
+import 'package:llamadart/llamadart.dart';
 
 import '../models/chat_model.dart';
 import '../models/message_model.dart';
@@ -89,11 +90,13 @@ class ChatController extends GetxController {
     _storage.saveChat(chat);
     chats.refresh();
 
-    // Build message history for LLM
-    final history = chat.messages
-        .where((m) => !m.isSystem)
-        .map((m) => m.toLlamaMessage())
-        .toList();
+    // Build message history for the LLM, bounded to what the loaded
+    // model's context can actually hold (with room left for the reply).
+    final effectiveSystemPrompt = chat.systemPrompt.isNotEmpty
+        ? chat.systemPrompt
+        : systemPrompt.value;
+    final messages = await _buildBoundedMessages(chat, effectiveSystemPrompt);
+    final replyBudget = _replyTokenBudget;
 
     // Start generation
     isGenerating.value = true;
@@ -104,12 +107,10 @@ class ChatController extends GetxController {
     chats.refresh();
 
     try {
-      final stream = _llm.generate(
-        messages: history,
-        systemPrompt: chat.systemPrompt.isNotEmpty
-            ? chat.systemPrompt
-            : systemPrompt.value,
-        temperature: temperature.value,
+      final stream = _llm.generateChatCompletion(
+        messages: messages,
+        params: const GenerationParams()
+            .copyWith(temp: temperature.value, maxTokens: replyBudget),
       );
 
       await for (final token in stream) {
@@ -137,6 +138,45 @@ class ChatController extends GetxController {
       _storage.saveChat(chat);
       chats.refresh();
     }
+  }
+
+  /// Tokens reserved for the model's reply, taken out of the context
+  /// budget before history is packed in. Scales with context size since
+  /// Android runs a much smaller context (1024) than desktop (2048).
+  int get _replyTokenBudget =>
+      (_llm.contextSize * 0.25).round().clamp(128, 512);
+
+  /// Build the message list sent to the model, dropping the oldest turns
+  /// once they no longer fit in the context window. The system prompt and
+  /// the most recent message are always kept, even if the latter alone
+  /// exceeds the remaining budget.
+  Future<List<LlamaChatMessage>> _buildBoundedMessages(
+    ChatModel chat,
+    String effectiveSystemPrompt,
+  ) async {
+    final budget = _llm.contextSize - _replyTokenBudget;
+    final systemTokens = effectiveSystemPrompt.isEmpty
+        ? 0
+        : await _llm.countTokens(effectiveSystemPrompt);
+    var remaining = budget - systemTokens;
+
+    final turns = chat.messages.where((m) => !m.isSystem).toList();
+    final kept = <MessageModel>[];
+    for (final msg in turns.reversed) {
+      final tokens = await _llm.countTokens(msg.content);
+      if (kept.isNotEmpty && tokens > remaining) break;
+      kept.insert(0, msg);
+      remaining -= tokens;
+    }
+
+    return [
+      if (effectiveSystemPrompt.isNotEmpty)
+        LlamaChatMessage.fromText(
+          role: LlamaChatRole.system,
+          text: effectiveSystemPrompt,
+        ),
+      ...kept.map((m) => m.toLlamaChatMessage()),
+    ];
   }
 
   /// Stop current generation.

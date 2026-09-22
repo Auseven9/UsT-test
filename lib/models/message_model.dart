@@ -1,4 +1,5 @@
 import 'package:hive/hive.dart';
+import 'package:llamadart/llamadart.dart';
 
 part 'message_model.g.dart';
 
@@ -41,10 +42,12 @@ class MessageModel extends HiveObject {
   bool get isAssistant => role == MessageRole.assistant;
   bool get isSystem => role == MessageRole.system;
 
-  Map<String, String> toLlamaMessage() {
-    return {
-      'role': role.name,
-      'content': content,
+  LlamaChatMessage toLlamaChatMessage() {
+    final chatRole = switch (role) {
+      MessageRole.user => LlamaChatRole.user,
+      MessageRole.assistant => LlamaChatRole.assistant,
+      MessageRole.system => LlamaChatRole.system,
     };
+    return LlamaChatMessage.fromText(role: chatRole, text: content);
   }
 }
