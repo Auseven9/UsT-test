@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
@@ -56,13 +58,32 @@ class ChatBubble extends StatelessWidget {
     if (isUser) {
       return Padding(
         padding: const EdgeInsets.only(top: 3),
-        child: Text(
-          message.content,
-          style: TextStyle(
-            fontSize: 15,
-            color: context.text,
-            height: 1.6,
-          ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (message.imageBase64 != null && message.imageBase64!.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: Image.memory(
+                    base64Decode(message.imageBase64!),
+                    width: 180,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, _, _) => const SizedBox.shrink(),
+                  ),
+                ),
+              ),
+            if (message.content.isNotEmpty)
+              Text(
+                message.content,
+                style: TextStyle(
+                  fontSize: 15,
+                  color: context.text,
+                  height: 1.6,
+                ),
+              ),
+          ],
         ),
       );
     }

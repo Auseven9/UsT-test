@@ -157,6 +157,33 @@ class ChatStorageService extends GetxService {
 
   set minP(double value) => _settingsBox.put('min_p', value);
 
+  /// Repeat penalty — llamadart/llama.cpp default is 1.1. Values above 1.0
+  /// discourage the model from repeating tokens it already used.
+  double get repeatPenalty =>
+      (_settingsBox.get('repeat_penalty', defaultValue: 1.1) as num)
+          .toDouble();
+
+  set repeatPenalty(double value) => _settingsBox.put('repeat_penalty', value);
+
+  /// Custom Jinja chat template overriding the one baked into the loaded
+  /// GGUF's `tokenizer.chat_template` metadata — for a model whose shipped
+  /// template is broken, missing, or just not what the user wants. Empty
+  /// string means "use the model's own template" (the normal case).
+  String get customChatTemplate =>
+      _settingsBox.get('custom_chat_template', defaultValue: '') as String;
+
+  set customChatTemplate(String value) =>
+      _settingsBox.put('custom_chat_template', value);
+
+  /// Whether the model is given tool-calling access (current date/time, a
+  /// calculator, and read-only memory search — see tool_definitions.dart).
+  /// Defaults on. Tool schemas add real prompt overhead on every turn even
+  /// when unused, so this is a genuine off switch, not just cosmetic.
+  bool get toolsEnabled =>
+      _settingsBox.get('tools_enabled', defaultValue: true) as bool;
+
+  set toolsEnabled(bool value) => _settingsBox.put('tools_enabled', value);
+
   /// Whether to instruct the model's chat template to produce visible
   /// reasoning (for templates that support toggling it). Off can mean
   /// faster, shorter responses on reasoning-tuned models — and side-steps

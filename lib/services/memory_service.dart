@@ -75,6 +75,26 @@ class MemoryService extends GetxService {
     await _persist();
   }
 
+  /// Same as [add], but skipped entirely if a near-duplicate (cosine
+  /// similarity above [dupThreshold]) is already stored — cheap insurance
+  /// against the memory file growing by one entry every time the user
+  /// repeats "my name is Alex" across ten different chats.
+  Future<bool> addIfNotDuplicate(
+    String text,
+    List<double> embedding, {
+    String? sourceChatId,
+    double dupThreshold = 0.92,
+  }) async {
+    if (text.trim().isEmpty || embedding.isEmpty) return false;
+    for (final entry in entries) {
+      if (_cosineSimilarity(embedding, entry.embedding) >= dupThreshold) {
+        return false;
+      }
+    }
+    await add(text, embedding, sourceChatId: sourceChatId);
+    return true;
+  }
+
   Future<void> delete(String id) async {
     entries.removeWhere((e) => e.id == id);
     await _persist();

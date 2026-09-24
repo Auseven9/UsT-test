@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:flutter/foundation.dart';
 import 'package:get/get.dart';
 import 'package:llamadart/llamadart.dart';
 import 'package:path/path.dart' as p;
@@ -15,11 +14,16 @@ import 'gguf_inspector.dart';
 /// answer text, `thinking` is reasoning/chain-of-thought llamadart's chat
 /// template engine separated out (empty when the model doesn't reason, or
 /// when its template wasn't recognized — see
-/// [LlmService.splitLeakedControlTokens] for that case).
+/// [LlmService.splitLeakedControlTokens] for that case). `toolCalls` arrives
+/// once, fully formed, in the final chunk of a turn where the model decided
+/// to call a tool instead of answering directly — llamadart parses the
+/// model's tool-call output completely before emitting it, so there's no
+/// incremental-fragment accumulation for callers to do.
 class GenerationChunk {
   final String content;
   final String thinking;
-  const GenerationChunk({this.content = '', this.thinking = ''});
+  final List<LlamaCompletionChunkToolCall>? toolCalls;
+  const GenerationChunk({this.content = '', this.thinking = '', this.toolCalls});
 }
 
 /// Wraps llamadart's LlamaEngine for model loading, generation, and lifecycle.
@@ -43,6 +47,13 @@ class LlmService extends GetxService {
   /// Whether a vision projector (mmproj) is currently paired with the loaded
   /// chat model, enabling image input.
   final hasVisionProjector = false.obs;
+
+  /// The loaded model's own trained context length, read from its GGUF
+  /// metadata (e.g. `qwen2.context_length`) after load — 0 means unknown
+  /// (no model loaded, or the key wasn't found). Settings uses this to cap
+  /// the Context Size slider at something the model can actually use,
+  /// instead of a flat guess.
+  final maxTrainedContext = 0.obs;
 
   StreamSubscription? _generateSub;
 
@@ -233,15 +244,21 @@ class LlmService extends GetxService {
       final cores = Platform.numberOfProcessors;
       final threads = cores <= 4 ? 0 : (cores * 3 / 4).round().clamp(4, 8);
 
+      final customTemplate = storage.customChatTemplate.trim();
+
       final params = ModelParams(
         contextSize: contextSize,
         gpuLayers: userGpuLayers,
         preferredBackend: parsedBackend,
         numberOfThreads: threads,
         numberOfThreadsBatch: threads,
+        chatTemplate: customTemplate.isNotEmpty ? customTemplate : null,
       );
 
-      log?.info('Backend=$parsedBackend, GPU layers=$userGpuLayers, ctx=$contextSize, threads=$threads (cores=$cores)', source: 'LLM');
+      log?.info(
+          'Backend=$parsedBackend, GPU layers=$userGpuLayers, ctx=$contextSize, '
+          'threads=$threads (cores=$cores)',
+          source: 'LLM');
 
       await _engine!.loadModel(path, modelParams: params);
       progressTimer.cancel();
@@ -258,6 +275,14 @@ class LlmService extends GetxService {
       isLoaded.value = true;
       loadedModelPath.value = path;
       log?.info('Model loaded successfully: $filename', source: 'LLM');
+
+      // Best-effort: read the model's own trained context length out of its
+      // GGUF metadata so Settings can bound the slider by what the model can
+      // actually use, not a flat guess. Fired off in the background rather
+      // than awaited here, so a slow metadata read never adds to the time
+      // loadModel() itself takes to return.
+      maxTrainedContext.value = 0;
+      unawaited(_loadMaxTrainedContext());
 
       // Enable wake lock for inference on mobile (keeps app from being killed)
       final modelName = p.basenameWithoutExtension(path);
@@ -300,6 +325,29 @@ class LlmService extends GetxService {
       rethrow;
     } finally {
       _resetLoadingState();
+    }
+  }
+
+  /// Reads the loaded model's trained context length from its GGUF metadata
+  /// in the background — see [loadModel]'s call site. Silently does nothing
+  /// if the engine's been torn down or reloaded by the time it finishes.
+  Future<void> _loadMaxTrainedContext() async {
+    final requestedFor = loadedModelPath.value;
+    try {
+      final metadata = await _engine?.getMetadata();
+      if (metadata == null || loadedModelPath.value != requestedFor) return;
+      for (final entry in metadata.entries) {
+        if (entry.key.endsWith('.context_length')) {
+          final parsed = int.tryParse(entry.value);
+          if (parsed != null && parsed > 0) {
+            maxTrainedContext.value = parsed;
+          }
+          break;
+        }
+      }
+    } catch (_) {
+      // Metadata read failing is fine — the slider just falls back to its
+      // flat cap.
     }
   }
 
@@ -372,6 +420,7 @@ class LlmService extends GetxService {
     required List<LlamaChatMessage> messages,
     GenerationParams params = const GenerationParams(),
     bool enableThinking = true,
+    List<ToolDefinition>? tools,
   }) async* {
     if (_engine == null || !isLoaded.value) {
       throw StateError('No model loaded. Call loadModel() first.');
@@ -379,6 +428,8 @@ class LlmService extends GetxService {
     if (isGenerating.value) {
       throw StateError('Another generation is already in progress.');
     }
+
+    final hasTools = tools != null && tools.isNotEmpty;
 
     isGenerating.value = true;
     tokensPerSecond.value = 0.0;
@@ -389,20 +440,24 @@ class LlmService extends GetxService {
       await for (final chunk in _engine!.create(
         messages,
         params: params,
-        toolChoice: ToolChoice.none,
+        tools: hasTools ? tools : null,
+        toolChoice: hasTools ? ToolChoice.auto : ToolChoice.none,
         enableThinking: enableThinking,
       )) {
         final choice = chunk.choices.isNotEmpty ? chunk.choices.first : null;
         final content = choice?.delta.content ?? '';
         final thinking = choice?.delta.thinking ?? '';
-        if (content.isEmpty && thinking.isEmpty) continue;
+        final toolCalls = choice?.delta.toolCalls;
+        if (content.isEmpty && thinking.isEmpty && (toolCalls == null || toolCalls.isEmpty)) {
+          continue;
+        }
 
         tokenCount++;
         if (stopwatch.elapsedMilliseconds > 0) {
           tokensPerSecond.value =
               tokenCount / (stopwatch.elapsedMilliseconds / 1000);
         }
-        yield GenerationChunk(content: content, thinking: thinking);
+        yield GenerationChunk(content: content, thinking: thinking, toolCalls: toolCalls);
       }
     } finally {
       stopwatch.stop();
@@ -524,6 +579,7 @@ class LlmService extends GetxService {
     loadedModelPath.value = '';
     tokensPerSecond.value = 0.0;
     hasVisionProjector.value = false;
+    maxTrainedContext.value = 0;
   }
 
   /// Unload the current model and free memory.

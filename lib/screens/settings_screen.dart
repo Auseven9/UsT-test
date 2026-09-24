@@ -13,6 +13,7 @@ import '../services/chat_storage_service.dart';
 import '../services/embedding_service.dart';
 import '../services/memory_service.dart';
 import '../services/crash_log_service.dart';
+import '../services/llm_service.dart';
 import '../routes/app_routes.dart';
 
 class SettingsScreen extends StatelessWidget {
@@ -865,7 +866,11 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
   late double _topP;
   late int _topK;
   late double _minP;
+  late double _repeatPenalty;
   late bool _enableThinking;
+  late bool _toolsEnabled;
+  late TextEditingController _customTemplateController;
+  final _customTemplateFocus = FocusNode();
   bool _showAdvanced = false;
 
   @override
@@ -875,11 +880,51 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
     _topP = widget.storage.topP;
     _topK = widget.storage.topK;
     _minP = widget.storage.minP;
+    _repeatPenalty = widget.storage.repeatPenalty;
     _enableThinking = widget.storage.enableModelThinking;
+    _toolsEnabled = widget.storage.toolsEnabled;
+    _customTemplateController =
+        TextEditingController(text: widget.storage.customChatTemplate);
+    // Persist on focus loss rather than every keystroke (same reasoning as
+    // the sliders below persisting on release, not on every drag tick).
+    _customTemplateFocus.addListener(() {
+      if (!_customTemplateFocus.hasFocus) {
+        widget.storage.customChatTemplate = _customTemplateController.text;
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _customTemplateController.dispose();
+    _customTemplateFocus.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    // Wrapped in Obx so the slider's bound updates the moment a model
+    // finishes loading and reports its real trained context length —
+    // without this, a Settings card kept alive in a tab's IndexedStack
+    // would never see maxTrainedContext change after its first build.
+    return Obx(() {
+      // Bound the slider by the loaded model's own trained context length
+      // when known, so it can't be dragged past what the model can actually
+      // use. Falls back to the flat 8192 cap when no model is loaded yet, or
+      // its metadata didn't report a context_length key.
+      int sliderMax = 8192;
+      try {
+        final llm = Get.find<LlmService>();
+        final trained = llm.maxTrainedContext.value;
+        if (trained > 512) sliderMax = trained.clamp(512, 131072);
+      } catch (_) {}
+      if (_contextSize > sliderMax) sliderMax = _contextSize;
+
+      return _buildCard(context, sliderMax);
+    });
+  }
+
+  Widget _buildCard(BuildContext context, int sliderMax) {
     return Container(
       decoration: BoxDecoration(
         color: context.bgPanel,
@@ -917,10 +962,10 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
             style: TextStyle(fontSize: 11, color: context.textD, height: 1.4),
           ),
           Slider(
-            value: _contextSize.toDouble(),
+            value: _contextSize.toDouble().clamp(512, sliderMax.toDouble()),
             min: 512,
-            max: 8192,
-            divisions: 15,
+            max: sliderMax.toDouble(),
+            divisions: ((sliderMax - 512) / 512).round().clamp(1, 255),
             activeColor: AppColors.accent,
             inactiveColor: context.border,
             label: '$_contextSize',
@@ -946,6 +991,27 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
             onChanged: (v) {
               setState(() => _enableThinking = v);
               widget.storage.enableModelThinking = v;
+            },
+            activeThumbColor: AppColors.accent,
+            contentPadding: EdgeInsets.zero,
+          ),
+
+          const SizedBox(height: 8),
+
+          // ── Tool calling toggle ──
+          SwitchListTile(
+            title: Text('Tool Calling',
+                style: TextStyle(color: context.text, fontSize: 14)),
+            subtitle: Text(
+              'Give the model access to a few offline tools: current date/'
+              'time, a calculator, and read-only memory search. Adds some '
+              'prompt overhead to every turn even when unused.',
+              style: TextStyle(color: context.textD, fontSize: 11),
+            ),
+            value: _toolsEnabled,
+            onChanged: (v) {
+              setState(() => _toolsEnabled = v);
+              widget.storage.toolsEnabled = v;
             },
             activeThumbColor: AppColors.accent,
             contentPadding: EdgeInsets.zero,
@@ -1020,6 +1086,61 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
               'Defaults (Top-P 0.95, Top-K 40, Min-P 0.05) are sane for most '
               'models — only change these if you know what you\'re tuning.',
               style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+            ),
+            const SizedBox(height: 12),
+            _samplingSlider(
+              context,
+              label: 'Repeat',
+              value: _repeatPenalty,
+              min: 1.0,
+              max: 2.0,
+              divisions: 20,
+              display: _repeatPenalty.toStringAsFixed(2),
+              onChanged: (v) => setState(() => _repeatPenalty = v),
+              onChangeEnd: (v) => widget.storage.repeatPenalty = v,
+            ),
+            Text(
+              'Repeat penalty (default 1.10) discourages the model from '
+              'reusing tokens it already used.',
+              style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+            ),
+            const SizedBox(height: 16),
+            Text('Custom Chat Template',
+                style: TextStyle(color: context.text, fontSize: 14)),
+            const SizedBox(height: 4),
+            Text(
+              'Overrides the Jinja chat template baked into the model\'s '
+              'GGUF — only useful if a specific model\'s shipped template is '
+              'broken or missing. Leave empty to use the model\'s own '
+              'template (the normal case). Applies on next model load.',
+              style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _customTemplateController,
+              focusNode: _customTemplateFocus,
+              maxLines: 4,
+              minLines: 2,
+              style: TextStyle(
+                color: context.text,
+                fontSize: 12,
+                fontFamily: 'monospace',
+              ),
+              decoration: InputDecoration(
+                hintText: '{% for message in messages %}...',
+                hintStyle: TextStyle(color: context.textD, fontSize: 12),
+                filled: true,
+                fillColor: context.bgInput,
+                contentPadding: const EdgeInsets.all(10),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: BorderSide(color: context.border),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: BorderSide(color: context.border),
+                ),
+              ),
             ),
           ],
         ],
@@ -1460,5 +1581,6 @@ class _HardwareSettingsCardState extends State<_HardwareSettingsCard> {
       ),
     );
   }
+
 }
 

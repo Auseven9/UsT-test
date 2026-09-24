@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 import 'package:get/get.dart';
 import 'package:llamadart/llamadart.dart';
 
@@ -8,6 +10,8 @@ import '../services/llm_service.dart';
 import '../services/chat_storage_service.dart';
 import '../services/embedding_service.dart';
 import '../services/memory_service.dart';
+import '../services/memory_heuristics.dart';
+import '../services/tool_definitions.dart';
 
 /// Hard safety cap on a single response, independent of context size —
 /// bounds worst-case generation time/battery drain if a model never
@@ -16,15 +20,34 @@ import '../services/memory_service.dart';
 /// this leaves real headroom rather than the flat 1024 it used to be.
 const _maxResponseTokens = 2048;
 
-/// How many tokens the per-turn memory-extraction prompt is allowed for its
-/// own (short) output.
-const _extractionMaxTokens = 200;
+/// Conservative flat reserve for the vision tokens an attached image adds to
+/// the prompt once encoded by the mmproj/CLIP pipeline — llamadart's
+/// LlamaChatMessage.content getter (which fitToContext's token counting
+/// relies on) only sees the text caption, not the image, so without this the
+/// sliding window would undercount an image turn's real size and could pack
+/// in more history than actually fits once the image is encoded.
+const _imageTokenReserve = 1024;
+
+/// Bounds how many tool-call ↔ tool-result round trips a single message can
+/// trigger before the app just gives up and returns whatever's happened so
+/// far — a model that keeps calling tools instead of answering shouldn't be
+/// able to turn one message into an unbounded battery/time sink on a phone.
+const _maxToolRounds = 3;
 
 class ChatController extends GetxController {
   final LlmService _llm = Get.find<LlmService>();
   final ChatStorageService _storage = Get.find<ChatStorageService>();
   final EmbeddingService _embedding = Get.find<EmbeddingService>();
   final MemoryService _memory = Get.find<MemoryService>();
+
+  // Rebuilt on every call rather than cached — `includeMemorySearch` must
+  // track the user's live Persistent Memory setting, since a model still
+  // holding a `search_memory` tool from before the user turned that setting
+  // off would keep reading memories the toggle was meant to stop exposing.
+  List<ToolDefinition> get _tools => buildToolDefinitions(
+        memory: _memory,
+        includeMemorySearch: _storage.persistentMemoryEnabled,
+      );
 
   final chats = <ChatModel>[].obs;
   final activeChatId = RxnString();
@@ -86,14 +109,27 @@ class ChatController extends GetxController {
     }
   }
 
-  /// Send a user message and stream AI response.
-  Future<void> sendMessage(String text, {String? modelFilename}) async {
-    if (text.trim().isEmpty) return;
+  /// Send a user message and stream AI response. [imageBytes] (already
+  /// downscaled by the caller — see ImageUtils.downscaleImageBytes) attaches
+  /// an image to this turn, only meaningful when a vision projector is
+  /// paired with the loaded model.
+  Future<void> sendMessage(
+    String text, {
+    String? modelFilename,
+    Uint8List? imageBytes,
+    String imageMimeType = 'image/png',
+  }) async {
+    if (text.trim().isEmpty && imageBytes == null) return;
     final chat = activeChat;
     if (chat == null) return;
 
     // Add user message
-    final userMsg = MessageModel(role: MessageRole.user, content: text.trim());
+    final userMsg = MessageModel(
+      role: MessageRole.user,
+      content: text.trim(),
+      imageBase64: imageBytes != null ? base64Encode(imageBytes) : null,
+      imageMimeType: imageBytes != null ? imageMimeType : null,
+    );
     chat.messages.add(userMsg);
     chat.autoTitle();
     chat.updatedAt = DateTime.now();
@@ -113,34 +149,63 @@ class ChatController extends GetxController {
     var effectiveSystemPrompt =
         chat.systemPrompt.isNotEmpty ? chat.systemPrompt : systemPrompt.value;
 
-    // Persistent memory: pull in anything relevant this app has remembered
-    // from *any* past conversation, not just this one.
+    // Persistent memory — entirely heuristic-gated, no chat-model call
+    // involved anywhere in this path. A cheap regex pass decides whether the
+    // message is worth an embedding call at all; when it's not (small talk,
+    // short acknowledgements — the common case in a normal chat), both
+    // retrieval and storage are skipped for free. When it is, the *same*
+    // embedding vector is reused for both retrieval and (if the text also
+    // looks like a durable fact) storage, so a memorable turn never costs
+    // more than one embedding call total. This is what keeps memory viable
+    // on-device: the only model ever invoked per turn is the embedding
+    // model, never the chat model.
+    List<double>? queryVector;
+    final trimmedText = text.trim();
     if (_storage.persistentMemoryEnabled &&
         _embedding.isLoaded.value &&
-        _memory.entries.isNotEmpty) {
-      final queryVector = await _embedding.embed(text.trim());
-      if (queryVector != null) {
-        final relevant = _memory.topK(queryVector, k: 3);
-        if (relevant.isNotEmpty) {
-          final memoryBlock = relevant.map((e) => '- ${e.text}').join('\n');
-          effectiveSystemPrompt =
-              '$effectiveSystemPrompt\n\nRelevant memory from earlier conversations:\n$memoryBlock';
+        !MemoryHeuristics.looksTrivial(trimmedText)) {
+      if (_memory.entries.isNotEmpty) {
+        queryVector = await _embedding.embed(trimmedText);
+        if (queryVector != null) {
+          final relevant = _memory.topK(queryVector, k: 2, minScore: 0.35);
+          if (relevant.isNotEmpty) {
+            final memoryBlock = relevant.map((e) => '- ${e.text}').join('\n');
+            effectiveSystemPrompt =
+                '$effectiveSystemPrompt\n\nRelevant memory from earlier conversations:\n$memoryBlock';
+          }
         }
       }
     }
 
+    // Only the just-attached image (if any) is sent as real multimodal
+    // content — older messages that happened to carry an image are
+    // represented as text only, with a short marker in their place. Vision
+    // encoding is expensive per the same on-device efficiency constraint
+    // that shaped the memory system: re-encoding every image in history on
+    // every single turn would make a multi-turn image conversation get
+    // slower with each reply instead of staying flat.
     final history = <LlamaChatMessage>[
       if (effectiveSystemPrompt.isNotEmpty)
         LlamaChatMessage.fromText(
           role: LlamaChatRole.system,
           text: effectiveSystemPrompt,
         ),
-      ...chat.messages.where((m) => !m.isSystem).map(
-            (m) => LlamaChatMessage.fromText(
-              role: m.isUser ? LlamaChatRole.user : LlamaChatRole.assistant,
-              text: m.content,
-            ),
-          ),
+      ...chat.messages.where((m) => !m.isSystem).map((m) {
+        final role = m.isUser ? LlamaChatRole.user : LlamaChatRole.assistant;
+        if (identical(m, userMsg) && imageBytes != null) {
+          return LlamaChatMessage.withContent(
+            role: role,
+            content: [
+              LlamaTextContent(m.content),
+              LlamaImageContent(bytes: imageBytes),
+            ],
+          );
+        }
+        final text = m.imageBase64 != null
+            ? '${m.content}\n[Image attached]'.trim()
+            : m.content;
+        return LlamaChatMessage.fromText(role: role, text: text);
+      }),
     ];
 
     // Sliding window: drop the oldest turns (never the system message) so
@@ -150,16 +215,17 @@ class ChatController extends GetxController {
     // in more than the response headroom it's supposed to leave, and the
     // two silently drifting apart is exactly how "leaves room to respond"
     // stops being true.
-    final fitted =
-        await _llm.fitToContext(history, reserveForResponse: _maxResponseTokens);
+    final fitted = await _llm.fitToContext(
+      history,
+      reserveForResponse:
+          _maxResponseTokens + (imageBytes != null ? _imageTokenReserve : 0),
+    );
 
-    // A background memory-extraction call (see _rememberFromTurn, fired
-    // after every previous message now, not just on context eviction) may
-    // still be occupying the engine's single generation slot. It's
-    // deliberately short, so wait briefly for it to clear instead of
-    // letting generateChatCompletion's StateError surface as a confusing
-    // "Another generation is already in progress" chat error for something
-    // the user never saw start.
+    // The engine only allows one generation at a time — the Local API
+    // Server feature (if enabled) can independently be mid-request right
+    // now, so wait briefly for that slot to free up instead of surfacing a
+    // confusing "Another generation is already in progress" chat error for
+    // something the user never saw start.
     var waitedMs = 0;
     while (_llm.isGenerating.value && waitedMs < 5000) {
       await Future.delayed(const Duration(milliseconds: 100));
@@ -175,30 +241,121 @@ class ChatController extends GetxController {
     chat.messages.add(aiMsg);
     chats.refresh();
 
-    try {
-      final stream = _llm.generateChatCompletion(
-        messages: fitted,
-        params: GenerationParams(
-          temp: temperature.value,
-          maxTokens: _maxResponseTokens,
-          topP: _storage.topP,
-          topK: _storage.topK,
-          minP: _storage.minP,
-        ),
-        enableThinking: _storage.enableModelThinking,
-      );
+    final activeTools = _storage.toolsEnabled ? _tools : null;
+    var roundMessages = fitted;
 
-      await for (final chunk in stream) {
-        if (chunk.thinking.isNotEmpty) {
-          streamedReasoning.value += chunk.thinking;
-          aiMsg.reasoning = streamedReasoning.value;
+    // Set once a round's tool calls have been consumed and fed back, so a
+    // following round's text doesn't run straight into the previous round's
+    // preface with no separator (e.g. "Let me check.It's 22°C.").
+    final pendingRoundSeparator = [false]; // mutable box, read/written by _streamGeneration
+    var exhaustedRounds = false;
+
+    try {
+      for (var round = 0; round < _maxToolRounds; round++) {
+        if (round > 0) {
+          // Tool results were just appended to roundMessages — re-fit
+          // against the context budget again, since those extra messages
+          // (the tool call plus each tool's result) count against it too,
+          // and the very first fitToContext call above never saw them.
+          roundMessages = await _llm.fitToContext(
+            roundMessages,
+            reserveForResponse:
+                _maxResponseTokens + (imageBytes != null ? _imageTokenReserve : 0),
+          );
         }
-        if (chunk.content.isNotEmpty) {
-          streamedResponse.value += chunk.content;
-          aiMsg.content = streamedResponse.value;
+        exhaustedRounds = round == _maxToolRounds - 1;
+
+        final toolCalls = await _streamGeneration(
+          messages: roundMessages,
+          aiMsg: aiMsg,
+          tools: activeTools,
+          separatorBox: pendingRoundSeparator,
+        );
+
+        if (toolCalls == null || toolCalls.isEmpty || activeTools == null) {
+          exhaustedRounds = false; // Model answered directly — done.
+          break;
         }
-        // Throttle UI refreshes
-        chats.refresh();
+        if (streamedResponse.value.isNotEmpty) pendingRoundSeparator[0] = true;
+
+        // Run each requested tool (independent calls run concurrently) and
+        // feed the results back for a follow-up generation. The assistant's
+        // tool-call message and each tool's result both need to go into
+        // history for the next round to make sense of what happened,
+        // mirroring the OpenAI-style tool protocol llamadart's chat
+        // templates expect.
+        final parsedCalls = toolCalls.map((tc) {
+          final name = tc.function?.name ?? '';
+          final rawArgs = tc.function?.arguments ?? '{}';
+          Map<String, dynamic> args;
+          try {
+            args = (jsonDecode(rawArgs) as Map).cast<String, dynamic>();
+          } catch (_) {
+            args = const {};
+          }
+          return (tc: tc, name: name, rawArgs: rawArgs, args: args);
+        }).toList();
+
+        final callContents = parsedCalls
+            .map((c) => LlamaToolCallContent(
+                  id: c.tc.id,
+                  name: c.name,
+                  arguments: c.args,
+                  rawJson: c.rawArgs,
+                ))
+            .toList();
+
+        final resultMessages = await Future.wait(parsedCalls.map((c) async {
+          ToolDefinition? tool;
+          for (final t in activeTools) {
+            if (t.name == c.name) {
+              tool = t;
+              break;
+            }
+          }
+          Object? result;
+          try {
+            result = tool == null
+                ? {'error': 'Unknown tool "${c.name}"'}
+                : await tool.invoke(c.args);
+          } catch (e) {
+            result = {'error': e.toString()};
+          }
+          return LlamaChatMessage.withContent(
+            role: LlamaChatRole.tool,
+            content: [
+              LlamaToolResultContent(id: c.tc.id, name: c.name, result: result),
+            ],
+          );
+        }));
+
+        roundMessages = [
+          ...roundMessages,
+          LlamaChatMessage.withContent(
+            role: LlamaChatRole.assistant,
+            content: callContents,
+          ),
+          ...resultMessages,
+        ];
+      }
+
+      // Hit the round cap with a tool result that was never followed up on
+      // (the model kept calling tools instead of answering) — force one
+      // last tools-disabled generation so the user gets a real answer built
+      // from whatever the tools returned, instead of a blank bubble.
+      if (exhaustedRounds) {
+        roundMessages = await _llm.fitToContext(
+          roundMessages,
+          reserveForResponse:
+              _maxResponseTokens + (imageBytes != null ? _imageTokenReserve : 0),
+        );
+        if (streamedResponse.value.isNotEmpty) pendingRoundSeparator[0] = true;
+        await _streamGeneration(
+          messages: roundMessages,
+          aiMsg: aiMsg,
+          tools: null,
+          separatorBox: pendingRoundSeparator,
+        );
       }
     } catch (e) {
       if (aiMsg.content.isEmpty) {
@@ -227,79 +384,82 @@ class ChatController extends GetxController {
       chats.refresh();
     }
 
-    // Fire-and-forget: distill *this* exchange into a memory note as soon as
-    // it happens, rather than waiting for the sliding window to evict it
-    // later — memory should reflect what the user just said, not just what
-    // eventually got old. Never blocks or fails the visible response above.
+    // Store the raw user statement as a memory note — no chat-model call
+    // involved. `looksMemorable` is a regex pass (first-person identity/
+    // preference statements, explicit "remember this", etc.); if it hits,
+    // reuse `queryVector` from the retrieval step above when we already
+    // computed one for this exact text, otherwise embed it now. Dedup
+    // against existing memories happens inside `addIfNotDuplicate`. Fully
+    // fire-and-forget and best-effort — must never affect the visible reply.
     if (_storage.persistentMemoryEnabled &&
-        aiMsg.content.isNotEmpty &&
-        _embedding.isLoaded.value) {
-      unawaited(_rememberFromTurn(userMsg, aiMsg, chat.id));
+        _embedding.isLoaded.value &&
+        MemoryHeuristics.looksMemorable(trimmedText)) {
+      unawaited(_rememberUserStatement(trimmedText, chat.id, queryVector));
     }
   }
 
-  /// Looks at the latest user+assistant exchange and, if it contains
-  /// anything worth remembering long-term, distills it into a memory note,
-  /// embeds it, and persists it — best-effort throughout; any failure here
-  /// is silent since it must never surface as a chat error. Runs after
-  /// every turn (not just when the sliding window evicts one) so memory
-  /// reflects what was just said, not just what's about to be forgotten.
-  Future<void> _rememberFromTurn(
-    MessageModel userMsg,
-    MessageModel aiMsg,
+  /// Runs one generation call, streaming content/thinking into [aiMsg] and
+  /// the `streamedResponse`/`streamedReasoning` Rx values as it arrives —
+  /// shared by both the main tool-round loop and the round-cap fallback
+  /// generation in [sendMessage] so the streaming/separator logic exists in
+  /// exactly one place. [separatorBox] is a 1-element mutable box: if its
+  /// value is true when this round's first content chunk arrives, a blank
+  /// line is inserted before it (bridging two rounds' text) and the flag is
+  /// cleared. Returns the tool calls the model requested, if any.
+  Future<List<LlamaCompletionChunkToolCall>?> _streamGeneration({
+    required List<LlamaChatMessage> messages,
+    required MessageModel aiMsg,
+    required List<ToolDefinition>? tools,
+    required List<bool> separatorBox,
+  }) async {
+    final stream = _llm.generateChatCompletion(
+      messages: messages,
+      params: GenerationParams(
+        temp: temperature.value,
+        maxTokens: _maxResponseTokens,
+        topP: _storage.topP,
+        topK: _storage.topK,
+        minP: _storage.minP,
+        penalty: _storage.repeatPenalty,
+      ),
+      enableThinking: _storage.enableModelThinking,
+      tools: tools,
+    );
+
+    List<LlamaCompletionChunkToolCall>? toolCalls;
+    await for (final chunk in stream) {
+      if (chunk.thinking.isNotEmpty) {
+        streamedReasoning.value += chunk.thinking;
+        aiMsg.reasoning = streamedReasoning.value;
+      }
+      if (chunk.content.isNotEmpty) {
+        if (separatorBox[0]) {
+          streamedResponse.value += '\n\n';
+          separatorBox[0] = false;
+        }
+        streamedResponse.value += chunk.content;
+        aiMsg.content = streamedResponse.value;
+      }
+      if (chunk.toolCalls != null && chunk.toolCalls!.isNotEmpty) {
+        toolCalls = chunk.toolCalls;
+      }
+      chats.refresh();
+    }
+    return toolCalls;
+  }
+
+  /// Embeds (reusing [precomputedVector] if the retrieval step already
+  /// produced one for this exact text) and stores [text] as a memory note,
+  /// skipping near-duplicates. Best-effort — any failure is silent.
+  Future<void> _rememberUserStatement(
+    String text,
     String chatId,
+    List<double>? precomputedVector,
   ) async {
     try {
-      if (!_llm.isLoaded.value || _llm.isGenerating.value) return;
-
-      final extractionRequest = <LlamaChatMessage>[
-        LlamaChatMessage.fromText(
-          role: LlamaChatRole.system,
-          text: 'You watch a conversation and extract durable facts or '
-              'preferences worth remembering in future, unrelated '
-              'conversations — things like the user\'s name, stated '
-              'preferences, ongoing projects, or personal details. Given the '
-              'exchange below, write ONE short sentence capturing anything '
-              'worth remembering, or respond with exactly NONE if there is '
-              'nothing durable (small talk, one-off questions, and the '
-              'model\'s own replies don\'t count).',
-        ),
-        LlamaChatMessage.fromText(role: LlamaChatRole.user, text: userMsg.content),
-        LlamaChatMessage.fromText(
-          role: LlamaChatRole.assistant,
-          text: aiMsg.content,
-        ),
-        LlamaChatMessage.fromText(
-          role: LlamaChatRole.user,
-          text: 'Extract anything worth remembering from the exchange above, '
-              'in one sentence, or respond NONE.',
-        ),
-      ];
-
-      final buffer = StringBuffer();
-      await for (final chunk in _llm.generateChatCompletion(
-        messages: extractionRequest,
-        params: const GenerationParams(
-          temp: 0.2,
-          maxTokens: _extractionMaxTokens,
-        ),
-        enableThinking: false,
-      )) {
-        buffer.write(chunk.content);
-      }
-
-      final extracted = buffer.toString().trim();
-      // Exact match on the sentinel only — a real extracted fact can
-      // legitimately contain the word "none" (e.g. "has none of the common
-      // allergies"), and .contains('NONE') would wrongly discard that.
-      if (extracted.isEmpty || extracted.toUpperCase() == 'NONE') {
-        return;
-      }
-
-      final vector = await _embedding.embed(extracted);
+      final vector = precomputedVector ?? await _embedding.embed(text);
       if (vector == null) return;
-
-      await _memory.add(extracted, vector, sourceChatId: chatId);
+      await _memory.addIfNotDuplicate(text, vector, sourceChatId: chatId);
     } catch (_) {
       // Best-effort background task — never let this affect the chat UI.
     }

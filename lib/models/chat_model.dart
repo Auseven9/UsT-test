@@ -44,6 +44,14 @@ class ChatModel extends HiveObject {
     final firstUserMsg = messages.where((m) => m.isUser).firstOrNull;
     if (firstUserMsg != null) {
       final raw = firstUserMsg.content.trim();
+      if (raw.isEmpty) {
+        // An image-only message (no caption text) leaves nothing to title
+        // from — fall back rather than setting title to '', which would
+        // permanently block every future autoTitle() call (it only runs
+        // while title == 'New Chat') and leave a blank sidebar row forever.
+        title = firstUserMsg.imageBase64 != null ? '📷 Image' : 'New Chat';
+        return;
+      }
       title = raw.length > 40 ? '${raw.substring(0, 40)}…' : raw;
     }
   }

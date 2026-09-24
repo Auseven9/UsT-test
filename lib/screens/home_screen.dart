@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 
@@ -6,6 +8,7 @@ import '../controllers/chat_controller.dart';
 import '../controllers/model_controller.dart';
 import '../controllers/theme_controller.dart';
 import '../services/llm_service.dart';
+import '../services/image_utils.dart';
 import '../widgets/chat_sidebar.dart';
 import '../widgets/chat_bubble.dart';
 import '../widgets/typing_indicator.dart';
@@ -30,6 +33,10 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _autoScrollToBottom = true;
   String? _lastRenderedChatId;
 
+  Uint8List? _attachedImageBytes;
+  bool _attachingImage = false;
+  Worker? _visionWorker;
+
   // Mobile bottom nav index: 0=Chat, 1=Models, 2=Settings
   int _mobileTabIndex = 0;
 
@@ -41,10 +48,20 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     _scrollController.addListener(_handleChatScroll);
+    // If the loaded model changes and no longer has a vision projector
+    // paired (switched models, or the projector was unpaired), drop any
+    // pending image attachment rather than silently sending text-only and
+    // leaving the user thinking the image went through.
+    _visionWorker = ever<bool>(_llm.hasVisionProjector, (hasVision) {
+      if (!hasVision && _attachedImageBytes != null) {
+        setState(() => _attachedImageBytes = null);
+      }
+    });
   }
 
   @override
   void dispose() {
+    _visionWorker?.dispose();
     _scrollController.removeListener(_handleChatScroll);
     _scrollController.dispose();
     _msgController.dispose();
@@ -79,19 +96,49 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _send() {
     final text = _msgController.text.trim();
-    if (text.isEmpty) return;
+    final image = _attachedImageBytes;
+    if (text.isEmpty && image == null) return;
 
     if (_chatCtrl.activeChat == null) {
       _chatCtrl.newChat();
     }
 
     _msgController.clear();
+    setState(() => _attachedImageBytes = null);
     _autoScrollToBottom = true;
     _chatCtrl.sendMessage(
       text,
       modelFilename: _modelCtrl.selectedModelFilename.value,
+      imageBytes: image,
     );
     _scrollToBottom(force: true);
+  }
+
+  Future<void> _pickImage() async {
+    if (_attachingImage) return;
+    setState(() => _attachingImage = true);
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.image,
+        withData: true,
+      );
+      final bytes = result?.files.single.bytes;
+      if (bytes == null) return;
+      final downscaled = await downscaleImageBytes(bytes);
+      if (mounted) setState(() => _attachedImageBytes = downscaled);
+    } catch (e) {
+      Get.snackbar(
+        'Couldn\'t attach image',
+        e.toString(),
+        snackPosition: SnackPosition.BOTTOM,
+      );
+    } finally {
+      if (mounted) setState(() => _attachingImage = false);
+    }
+  }
+
+  void _removeAttachedImage() {
+    setState(() => _attachedImageBytes = null);
   }
 
   @override
@@ -1041,7 +1088,11 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildInputArea() {
     return Container(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-      child: Container(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (_attachedImageBytes != null) _buildAttachedImagePreview(),
+          Container(
         decoration: BoxDecoration(
           color: context.bgInput,
           border: Border.all(color: context.border),
@@ -1057,6 +1108,28 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
+            // Attach image (only when a vision projector is paired)
+            Obx(
+              () => _llm.hasVisionProjector.value
+                  ? Padding(
+                      padding: const EdgeInsets.only(left: 8, bottom: 6),
+                      child: _attachingImage
+                          ? const SizedBox(
+                              width: 36,
+                              height: 36,
+                              child: Padding(
+                                padding: EdgeInsets.all(8),
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              ),
+                            )
+                          : IconButton(
+                              icon: Icon(Icons.image_outlined, color: context.textM),
+                              tooltip: 'Attach image',
+                              onPressed: _pickImage,
+                            ),
+                    )
+                  : const SizedBox.shrink(),
+            ),
             // Text field
             Expanded(
               child: TextField(
@@ -1102,6 +1175,44 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
         ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAttachedImagePreview() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8, left: 8),
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: Image.memory(
+              _attachedImageBytes!,
+              width: 64,
+              height: 64,
+              fit: BoxFit.cover,
+            ),
+          ),
+          Positioned(
+            top: -6,
+            right: -6,
+            child: InkWell(
+              onTap: _removeAttachedImage,
+              borderRadius: BorderRadius.circular(10),
+              child: Container(
+                padding: const EdgeInsets.all(2),
+                decoration: const BoxDecoration(
+                  color: AppColors.red,
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.close, size: 14, color: Colors.white),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
