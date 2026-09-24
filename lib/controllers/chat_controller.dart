@@ -6,6 +6,7 @@ import 'package:llamadart/llamadart.dart';
 
 import '../models/chat_model.dart';
 import '../models/message_model.dart';
+import '../models/memory_entry.dart';
 import '../services/llm_service.dart';
 import '../services/chat_storage_service.dart';
 import '../services/embedding_service.dart';
@@ -161,14 +162,30 @@ class ChatController extends GetxController {
     // gate already flagged, and ideally on a dedicated small helper model
     // rather than the main chat model; see HelperLlmService.)
     List<double>? queryVector;
+    // Captured here so the extraction step later can reuse the exact same
+    // retrieval — needed to let it judge whether the new turn *contradicts*
+    // one of these (e.g. an updated fact) without a second retrieval pass.
+    List<MemoryEntry> relevantMemoriesForTurn = const [];
     final trimmedText = text.trim();
-    if (_storage.persistentMemoryEnabled &&
-        _embedding.isLoaded.value &&
-        !MemoryHeuristics.looksTrivial(trimmedText)) {
-      if (_memory.entries.isNotEmpty) {
+    if (_storage.persistentMemoryEnabled && _embedding.isLoaded.value) {
+      // The model has no memory-write tool (search_memory is read-only, by
+      // design — see tool_definitions.dart) because storage isn't its job:
+      // it happens automatically in the background after the turn. Without
+      // being told that, a model asked to "remember X" — finding no save
+      // tool available — tends to narrate as if it saved something anyway
+      // ("I'm filing that away"), which is a little dishonest since it did
+      // nothing of the kind. One short line heads that off.
+      effectiveSystemPrompt =
+          '$effectiveSystemPrompt\n\nDurable facts and preferences worth '
+          'remembering are captured automatically in the background after '
+          'each message — you have no tool for this and don\'t need one; '
+          'just answer naturally.';
+
+      if (!MemoryHeuristics.looksTrivial(trimmedText) && _memory.entries.isNotEmpty) {
         queryVector = await _embedding.embed(trimmedText);
         if (queryVector != null) {
           final relevant = _memory.topK(queryVector, k: 2, minScore: 0.35);
+          relevantMemoriesForTurn = relevant;
           if (relevant.isNotEmpty) {
             final memoryBlock = relevant.map((e) => '- ${e.text}').join('\n');
             effectiveSystemPrompt =
@@ -259,9 +276,11 @@ class ChatController extends GetxController {
     var responseBudget = fitResult.responseBudget.clamp(1, _maxResponseTokens);
 
     // Set once a round's tool calls have been consumed and fed back, so a
-    // following round's text doesn't run straight into the previous round's
-    // preface with no separator (e.g. "Let me check.It's 22°C.").
-    final pendingRoundSeparator = [false]; // mutable box, read/written by _streamGeneration
+    // following round's text/reasoning doesn't run straight into the
+    // previous round's with no separator (e.g. "Let me check.It's 22°C.",
+    // or two rounds' reasoning reading as one duplicated block).
+    // [contentPending, reasoningPending] — see _streamGeneration's doc.
+    final pendingRoundSeparator = [false, false];
     var exhaustedRounds = false;
 
     try {
@@ -294,6 +313,7 @@ class ChatController extends GetxController {
           break;
         }
         if (streamedResponse.value.isNotEmpty) pendingRoundSeparator[0] = true;
+        if (streamedReasoning.value.isNotEmpty) pendingRoundSeparator[1] = true;
 
         // Run each requested tool (independent calls run concurrently) and
         // feed the results back for a follow-up generation. The assistant's
@@ -369,6 +389,7 @@ class ChatController extends GetxController {
         roundMessages = refit.messages;
         responseBudget = refit.responseBudget.clamp(1, _maxResponseTokens);
         if (streamedResponse.value.isNotEmpty) pendingRoundSeparator[0] = true;
+        if (streamedReasoning.value.isNotEmpty) pendingRoundSeparator[1] = true;
         await _streamGeneration(
           messages: roundMessages,
           aiMsg: aiMsg,
@@ -428,7 +449,12 @@ class ChatController extends GetxController {
     if (_storage.persistentMemoryEnabled &&
         _embedding.isLoaded.value &&
         MemoryHeuristics.looksMemorable(trimmedText)) {
-      unawaited(_extractAndRememberFromTurn(userMsg, aiMsg, chat.id));
+      unawaited(_extractAndRememberFromTurn(
+        userMsg,
+        aiMsg,
+        chat.id,
+        relevantMemoriesForTurn,
+      ));
     }
   }
 
@@ -436,10 +462,16 @@ class ChatController extends GetxController {
   /// the `streamedResponse`/`streamedReasoning` Rx values as it arrives —
   /// shared by both the main tool-round loop and the round-cap fallback
   /// generation in [sendMessage] so the streaming/separator logic exists in
-  /// exactly one place. [separatorBox] is a 1-element mutable box: if its
-  /// value is true when this round's first content chunk arrives, a blank
-  /// line is inserted before it (bridging two rounds' text) and the flag is
-  /// cleared. Returns the tool calls the model requested, if any.
+  /// exactly one place. [separatorBox] is a 2-element mutable box —
+  /// `[contentPending, reasoningPending]` — tracked independently because
+  /// thinking and content don't necessarily both appear in a given round
+  /// (a pure tool-call round can be thinking-only). If the relevant flag is
+  /// true when this round's first chunk of that kind arrives, a separator
+  /// is inserted before it (so a follow-up round's reasoning/answer doesn't
+  /// run straight into the previous round's with no boundary — a model
+  /// re-deriving similar reasoning across rounds would otherwise look like
+  /// its thoughts got flatly duplicated) and the flag is cleared. Returns
+  /// the tool calls the model requested, if any.
   Future<List<LlamaCompletionChunkToolCall>?> _streamGeneration({
     required List<LlamaChatMessage> messages,
     required MessageModel aiMsg,
@@ -464,6 +496,10 @@ class ChatController extends GetxController {
     List<LlamaCompletionChunkToolCall>? toolCalls;
     await for (final chunk in stream) {
       if (chunk.thinking.isNotEmpty) {
+        if (separatorBox[1]) {
+          streamedReasoning.value += '\n\n---\n\n';
+          separatorBox[1] = false;
+        }
         streamedReasoning.value += chunk.thinking;
         aiMsg.reasoning = streamedReasoning.value;
       }
@@ -485,24 +521,32 @@ class ChatController extends GetxController {
 
   /// Looks at the latest user+assistant exchange — already flagged by
   /// [MemoryHeuristics.looksMemorable] as worth capturing — and asks the
-  /// model to distill anything durable into one short sentence, so
-  /// something like "remember that" (which names nothing on its own)
+  /// model to distill anything durable, tagged with category/valence/tags,
+  /// so something like "remember that" (which names nothing on its own)
   /// correctly captures whatever it was pointing at instead of being stored
-  /// as its own three words. Bounded and cheap (short output, low temp),
-  /// and only ever runs on a turn the heuristic gate already flagged — not
-  /// on every turn, which is what made the old design too slow for a phone.
-  /// Best-effort throughout; any failure here is silent since it must never
-  /// surface as a chat error.
+  /// as its own three words. Also given [relevantMemories] — the same
+  /// memories already retrieved for this turn's system prompt, at no extra
+  /// retrieval cost — so it can flag when the new fact contradicts one of
+  /// them (an updated fact), in which case the old one is marked superseded
+  /// rather than left to compete equally with the current one. Bounded and
+  /// cheap (short output, low temp), and only ever runs on a turn the
+  /// heuristic gate already flagged — not every turn. Best-effort
+  /// throughout; any failure here is silent since it must never surface as
+  /// a chat error, and a small model producing malformed output degrades to
+  /// the plain-text behavior this replaced rather than losing the memory.
   Future<void> _extractAndRememberFromTurn(
     MessageModel userMsg,
     MessageModel aiMsg,
     String chatId,
+    List<MemoryEntry> relevantMemories,
   ) async {
     try {
       final useHelper = _helper.isLoaded.value;
       if (!useHelper && !_llm.isLoaded.value) return;
 
-      const extractionMaxTokens = 80;
+      // A bit more room than a one-sentence extraction needed, to fit the
+      // small JSON structure (text/category/valence/tags) below.
+      const extractionMaxTokens = 130;
 
       // A long exchange (a big assistant reply is exactly the case most
       // likely to actually contain something worth remembering) can exceed
@@ -525,7 +569,12 @@ class ChatController extends GetxController {
       final extractionContextEstimate =
           useHelper ? 2048 : (await _llm.getContextSize()).clamp(256, 2048);
       const approxCharsPerToken = 4;
-      const overheadTokens = 150; // system prompt + trailing instruction
+      // System prompt + JSON-format instructions + trailing instruction —
+      // the JSON-structured extraction prompt roughly doubled this versus
+      // the old one-sentence version, so the old flat 150 badly
+      // undercounted real overhead once the "already remembered" context
+      // block is added below too.
+      const overheadTokens = 350;
       final availableTokens =
           (extractionContextEstimate - extractionMaxTokens - overheadTokens)
               .clamp(40, extractionContextEstimate);
@@ -533,6 +582,24 @@ class ChatController extends GetxController {
           (availableTokens * approxCharsPerToken / 2).round().clamp(100, 4000);
       String cap(String s) =>
           s.length > maxCharsEach ? '${s.substring(0, maxCharsEach)}…' : s;
+
+      // Memory notes are themselves distilled to one short sentence, but
+      // capped defensively anyway — this block adds to the same token
+      // budget being carefully bounded above, and nothing guarantees an
+      // old note (especially one recovered via the truncated-JSON fallback
+      // elsewhere in this file) stayed short.
+      String capMemoryText(String s) => s.length > 150 ? '${s.substring(0, 150)}…' : s;
+      // Numbered, not bulleted — with more than one memory shown, the model
+      // needs to say WHICH one a new fact contradicts (contradicts_index
+      // below), not just "yes something was contradicted". A bare boolean
+      // would leave no way to tell #1 from #2, and guessing "the first one"
+      // is exactly the kind of wrong-target correction this feature exists
+      // to prevent.
+      final existingMemoryContext = relevantMemories.isEmpty
+          ? ''
+          : '\n\nAlready remembered, for reference — numbered so you can say '
+              'which one (if any) the new exchange contradicts/updates (e.g. '
+              'a changed fact):\n${relevantMemories.indexed.map((e) => '${e.$1 + 1}. ${capMemoryText(e.$2.text)}').join('\n')}';
 
       final extractionRequest = <LlamaChatMessage>[
         LlamaChatMessage.fromText(
@@ -544,16 +611,22 @@ class ChatController extends GetxController {
               'something they explicitly asked to be remembered (if they '
               'said "remember that" or similar, figure out from the '
               'exchange what "that" refers to and capture the actual '
-              'content, not the instruction itself). Write ONE short '
-              'sentence capturing anything worth remembering, or respond '
-              'with exactly NONE if there is nothing durable.',
+              'content, not the instruction itself).'
+              '$existingMemoryContext\n\n'
+              'Respond with ONLY a single-line JSON object, no other text: '
+              '{"text": "<one short sentence, or empty string if nothing '
+              'durable>", "category": "<fact|preference|event|instruction|'
+              'general>", "valence": "<positive|negative|neutral>", '
+              '"tags": ["<a few short keywords>"], "contradicts_index": '
+              '<the number of the already-remembered item above that this '
+              'replaces/updates, or null if none>}',
         ),
         LlamaChatMessage.fromText(role: LlamaChatRole.user, text: cap(userMsg.content)),
         LlamaChatMessage.fromText(role: LlamaChatRole.assistant, text: cap(aiMsg.content)),
         LlamaChatMessage.fromText(
           role: LlamaChatRole.user,
-          text: 'Extract anything worth remembering from the exchange above, '
-              'in one sentence, or respond NONE.',
+          text: 'Extract anything worth remembering from the exchange above '
+              'as that JSON object, and nothing else.',
         ),
       ];
 
@@ -616,14 +689,143 @@ class ChatController extends GetxController {
 
       if (extracted == null) return;
       extracted = extracted.trim();
-      if (MemoryHeuristics.isNoMemorySentinel(extracted)) return;
 
-      final vector = await _embedding.embed(extracted);
+      final parsed = _parseExtractionJson(extracted);
+      // A response that starts with '{' was clearly attempting JSON (the
+      // prompt asks for nothing else) — if full parsing still failed, it's
+      // a broken fragment, not a natural sentence, so it must never be
+      // stored verbatim (braces, quotes, field names and all) as if it were
+      // the memory itself. _parseExtractionJson already tries a regex-based
+      // partial recovery of just the "text" field for exactly this
+      // truncated-mid-object case; if even that comes back empty, there's
+      // nothing safe to save from this turn.
+      final looksLikeBrokenJson = parsed == null && extracted.trimLeft().startsWith('{');
+      if (looksLikeBrokenJson) return;
+
+      final noteText = parsed?.text ?? extracted;
+      final category = parsed?.category ?? 'general';
+      final valence = parsed?.valence ?? 'neutral';
+      final tags = parsed?.tags ?? const <String>[];
+      // 1-based index into relevantMemories, as shown to the model in the
+      // numbered "already remembered" list — null/out-of-range means no
+      // contradiction (or the model named something that isn't there).
+      final contradictsIndex = parsed?.contradictsIndex;
+      final contradictedMemory =
+          (contradictsIndex != null && contradictsIndex >= 1 && contradictsIndex <= relevantMemories.length)
+              ? relevantMemories[contradictsIndex - 1]
+              : null;
+
+      // Whether JSON parsed or not, the "nothing durable" check still runs
+      // on the actual candidate text — a malformed-JSON model that still
+      // wrote "NONE" as its `text` field (or the whole raw response, if
+      // parsing failed outright) is still correctly recognized as empty.
+      if (MemoryHeuristics.isNoMemorySentinel(noteText)) return;
+
+      final vector = await _embedding.embed(noteText);
       if (vector == null) return;
-      await _memory.addIfNotDuplicate(extracted, vector, sourceChatId: chatId);
+
+      if (contradictedMemory != null) {
+        // A correction must always create a fresh, superseding memory —
+        // never go through addIfNotDuplicate's near-duplicate check here.
+        // A corrected fact (e.g. "favorite color is green" replacing
+        // "...is blue") can easily stay above the duplicate-similarity
+        // threshold against the OLD entry it's meant to replace, since the
+        // two sentences are structurally almost identical — that would
+        // silently reinforce the wrong (outdated) memory instead of
+        // recording the correction at all.
+        final newId = await _memory.add(
+          noteText,
+          vector,
+          sourceChatId: chatId,
+          category: category,
+          valence: valence,
+          tags: tags,
+        );
+        if (newId != null) {
+          await _memory.markSuperseded(contradictedMemory.id, newId);
+        }
+      } else {
+        await _memory.addIfNotDuplicate(
+          noteText,
+          vector,
+          sourceChatId: chatId,
+          category: category,
+          valence: valence,
+          tags: tags,
+        );
+      }
     } catch (_) {
       // Best-effort background task — never let this affect the chat UI.
     }
+  }
+
+  static final RegExp _extractedTextFieldPattern =
+      RegExp(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"');
+
+  /// Best-effort parse of the extraction model's JSON response. Returns
+  /// null (never throws) if nothing usable could be recovered at all, so
+  /// the caller can fall back to treating the raw text as a plain memory
+  /// note — a small quantized model failing to format valid JSON should
+  /// degrade gracefully, not lose the memory entirely.
+  ({String text, String category, String valence, List<String> tags, int? contradictsIndex})?
+      _parseExtractionJson(String raw) {
+    const validCategories = {'fact', 'preference', 'event', 'instruction', 'general'};
+    const validValences = {'positive', 'negative', 'neutral'};
+
+    try {
+      final start = raw.indexOf('{');
+      final end = raw.lastIndexOf('}');
+      if (start != -1 && end != -1 && end > start) {
+        final decoded = jsonDecode(raw.substring(start, end + 1));
+        if (decoded is Map) {
+          final text = (decoded['text'] as Object?)?.toString().trim() ?? '';
+          final categoryRaw = (decoded['category'] as Object?)?.toString().toLowerCase();
+          final valenceRaw = (decoded['valence'] as Object?)?.toString().toLowerCase();
+          final tagsRaw = decoded['tags'];
+          final tags = tagsRaw is List
+              ? tagsRaw
+                  .map((e) => e.toString().trim())
+                  .where((e) => e.isNotEmpty)
+                  .take(5)
+                  .toList()
+              : <String>[];
+          // Accept a real JSON number or a stringified one ("2") — a small
+          // quantized model quoting a number is a common enough formatting
+          // slip. null/"null"/missing/anything else means "no contradiction".
+          final contradictsRaw = decoded['contradicts_index'];
+          final contradictsIndex = contradictsRaw is num
+              ? contradictsRaw.toInt()
+              : int.tryParse(contradictsRaw?.toString() ?? '');
+
+          return (
+            text: text,
+            category: validCategories.contains(categoryRaw) ? categoryRaw! : 'general',
+            valence: validValences.contains(valenceRaw) ? valenceRaw! : 'neutral',
+            tags: tags,
+            contradictsIndex: contradictsIndex,
+          );
+        }
+      }
+    } catch (_) {
+      // Fall through to partial recovery below.
+    }
+
+    // Full parse failed — most likely the response got cut off mid-object
+    // by the token cap before the closing brace. Try to salvage just the
+    // "text" field via regex: if the model got that far before running out
+    // of budget, the fact itself is usually still intact even though the
+    // rest of the object (category/tags/etc) never got written.
+    final match = _extractedTextFieldPattern.firstMatch(raw);
+    if (match == null) return null;
+    final recovered = match.group(1)?.trim() ?? '';
+    if (recovered.isEmpty) return null;
+    return (
+      text: recovered,
+      category: 'general',
+      valence: 'neutral',
+      tags: const [],
+      contradictsIndex: null,
+    );
   }
 
   /// Stop current generation.

@@ -87,6 +87,7 @@ List<ToolDefinition> buildToolDefinitions({
           if (terms.isEmpty) return {'results': <String>[]};
 
           final matches = memory.entries.where((e) {
+            if (!e.isActive) return false; // superseded — an outdated fact
             final text = e.text.toLowerCase();
             return terms.any((t) => text.contains(t));
           }).take(5).map((e) => e.text).toList();

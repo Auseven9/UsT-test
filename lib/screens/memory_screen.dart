@@ -150,12 +150,13 @@ class _MemoryTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final superseded = !entry.isActive;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: context.bgPanel,
-        border: Border.all(color: context.border),
+        border: Border.all(color: superseded ? context.borderFaint : context.border),
         borderRadius: BorderRadius.circular(12),
       ),
       child: Row(
@@ -165,13 +166,31 @@ class _MemoryTile extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 4,
+                  children: [
+                    _chip(context, entry.category, _categoryColor(context, entry.category)),
+                    _chip(context, entry.valence, _valenceColor(context, entry.valence)),
+                    for (final tag in entry.tags) _chip(context, tag, context.textD),
+                    if (superseded) _chip(context, 'superseded', AppColors.red),
+                  ],
+                ),
+                const SizedBox(height: 8),
                 Text(
                   entry.text,
-                  style: TextStyle(fontSize: 13, color: context.text, height: 1.4),
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: superseded ? context.textD : context.text,
+                    height: 1.4,
+                    decoration: superseded ? TextDecoration.lineThrough : null,
+                  ),
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  _formatDate(entry.createdAt),
+                  '${_formatDate(entry.createdAt)}'
+                  '${entry.accessCount > 0 ? ' · recalled ${entry.accessCount}×' : ''}'
+                  '${entry.linkedIds.isNotEmpty ? ' · ${entry.linkedIds.length} linked' : ''}',
                   style: TextStyle(fontSize: 11, color: context.textD),
                 ),
               ],
@@ -185,6 +204,46 @@ class _MemoryTile extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  Widget _chip(BuildContext context, String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(fontSize: 10, color: color, fontWeight: FontWeight.w600),
+      ),
+    );
+  }
+
+  Color _categoryColor(BuildContext context, String category) {
+    switch (category) {
+      case 'fact':
+        return AppColors.accent;
+      case 'preference':
+        return AppColors.green;
+      case 'event':
+        return AppColors.orange;
+      case 'instruction':
+        return AppColors.accentHi;
+      default:
+        return context.textM;
+    }
+  }
+
+  Color _valenceColor(BuildContext context, String valence) {
+    switch (valence) {
+      case 'positive':
+        return AppColors.green;
+      case 'negative':
+        return AppColors.red;
+      default:
+        return context.textM;
+    }
   }
 
   String _formatDate(DateTime dt) {
