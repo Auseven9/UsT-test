@@ -113,7 +113,7 @@ class ChatStorageService extends GetxService {
   // ── Persistent Memory ───────────────────────────────────────
 
   bool get persistentMemoryEnabled =>
-      _settingsBox.get('persistent_memory_enabled', defaultValue: false)
+      _settingsBox.get('persistent_memory_enabled', defaultValue: true)
           as bool;
 
   set persistentMemoryEnabled(bool value) =>
@@ -127,17 +127,29 @@ class ChatStorageService extends GetxService {
   set memoryEmbeddingModelFilename(String value) =>
       _settingsBox.put('memory_embedding_model', value);
 
+  /// Filename of a small/fast chat model dedicated to background memory
+  /// extraction, loaded in its own engine separate from the main chat model
+  /// — empty string means none selected, in which case extraction falls
+  /// back to running on the main model.
+  String get helperModelFilename =>
+      _settingsBox.get('helper_model', defaultValue: '') as String;
+
+  set helperModelFilename(String value) => _settingsBox.put('helper_model', value);
+
   // ── Context & Sampling ──────────────────────────────────────
 
-  /// Context window size (n_ctx) applied at model load time. Defaults match
-  /// the old hardcoded per-platform values (1024 on Android — smaller,
-  /// specifically to avoid the Low Memory Killer on RAM-constrained
-  /// devices — 2048 elsewhere) for anyone who hasn't touched the new
-  /// slider yet, rather than silently doubling an existing Android user's
-  /// effective context on their next model load after upgrading.
+  /// Context window size (n_ctx) applied at model load time. Raised from
+  /// the original conservative defaults (1024 Android / 2048 elsewhere,
+  /// picked to avoid the Low Memory Killer on old RAM-constrained phones)
+  /// to something that actually leaves room for a system prompt, tool
+  /// schemas, memory, and a real response without constantly hitting the
+  /// sliding-window floor — on a modern flagship, 1024 tokens of total
+  /// context was the direct cause of garbled/chopped replies. Still
+  /// user-adjustable (and bounded by the loaded model's real trained
+  /// context) via the Context Size slider in Settings.
   int get contextSize => (_settingsBox.get(
         'context_size',
-        defaultValue: Platform.isAndroid ? 1024 : 2048,
+        defaultValue: Platform.isAndroid ? 4096 : 8192,
       ) as num)
           .toInt();
 

@@ -10,6 +10,7 @@ import '../services/local_api_server_service.dart';
 import '../services/wakelock_service.dart';
 import '../services/log_service.dart';
 import '../services/embedding_service.dart';
+import '../services/helper_llm_service.dart';
 import '../services/memory_service.dart';
 import '../services/background_optimizer_service.dart';
 import '../routes/app_routes.dart';
@@ -51,6 +52,7 @@ class _SplashScreenState extends State<SplashScreen> {
       log.info('Setting up persistent memory...', source: 'Splash');
       final memory = await Get.find<MemoryService>().init();
       final embedding = await Get.find<EmbeddingService>().init();
+      final helper = await Get.find<HelperLlmService>().init();
       log.info('${memory.entries.length} memories loaded', source: 'Splash');
 
       // Restore the embedding model across restarts, same as the local API
@@ -66,6 +68,20 @@ class _SplashScreenState extends State<SplashScreen> {
           await embedding.loadModel(path);
         } catch (e) {
           log.error('Could not restore embedding model: $e', source: 'Splash');
+        }
+      }
+
+      // Same restoration for the optional background-extraction helper
+      // model — otherwise it would silently fall back to the (slow) main
+      // model after every relaunch.
+      if (storage.helperModelFilename.isNotEmpty) {
+        try {
+          final path = modelManager.getModelPathByFilename(
+            storage.helperModelFilename,
+          );
+          await helper.loadModel(path);
+        } catch (e) {
+          log.error('Could not restore helper model: $e', source: 'Splash');
         }
       }
 

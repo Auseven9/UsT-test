@@ -243,6 +243,21 @@ class LocalApiServerService extends GetxService {
     }
 
     if (isBusy) {
+      // Background persistent-memory extraction (a short, cheap generation
+      // fired after a "memorable" chat turn, when no dedicated helper model
+      // is configured) can hold this same slot for up to ~23s (a 3s wait
+      // for the slot plus a 20s generation timeout — see
+      // ChatController._extractAndRememberFromTurn) — wait long enough to
+      // actually cover that instead of rejecting a request an external
+      // client had no way to know would collide with something the chat UI
+      // shows nothing in progress for.
+      var waitedMs = 0;
+      while (isBusy && waitedMs < 23000) {
+        await Future.delayed(const Duration(milliseconds: 200));
+        waitedMs += 200;
+      }
+    }
+    if (isBusy) {
       await _writeError(
         request.response,
         HttpStatus.tooManyRequests,

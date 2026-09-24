@@ -48,4 +48,26 @@ class MemoryHeuristics {
     if (trimmed.length <= 3) return true;
     return _trivialExact.contains(trimmed);
   }
+
+  static final RegExp _noneWord = RegExp(r'\b(none|nothing|n/a|nil)\b', caseSensitive: false);
+
+  /// Whether an LLM's extraction response amounts to "nothing worth
+  /// remembering" — deliberately more forgiving than an exact `== 'NONE'`
+  /// check, since a small on-device model asked to "respond with exactly
+  /// NONE" often instead hedges with a full sentence around it, e.g. "I
+  /// don't think there's anything notable to remember here, so I'll say
+  /// NONE." Gated on word count (at most 20 — generous enough to cover that
+  /// kind of hedge, but a real extracted memory fact is essentially never
+  /// this wordy) precisely so a genuine short memory that happens to
+  /// contain the word "none" — e.g. "User has none of the common
+  /// allergies" (7 words) — is still comfortably under the cap and kept;
+  /// only responses that are ALSO mostly about there being nothing to
+  /// remember, not just short, get discarded.
+  static bool isNoMemorySentinel(String text) {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return true;
+    final words = trimmed.split(RegExp(r'\s+'));
+    if (words.length > 20) return false;
+    return _noneWord.hasMatch(trimmed);
+  }
 }

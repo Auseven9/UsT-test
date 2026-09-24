@@ -7,6 +7,7 @@ import '../services/local_api_server_service.dart';
 import '../services/wakelock_service.dart';
 import '../services/log_service.dart';
 import '../services/embedding_service.dart';
+import '../services/helper_llm_service.dart';
 import '../services/memory_service.dart';
 import '../services/crash_log_service.dart';
 import '../services/resource_monitor_service.dart';
@@ -26,6 +27,7 @@ class AppBindings extends Bindings {
     Get.lazyPut(() => WakelockService(), fenix: true);
     Get.lazyPut(() => LogService(), fenix: true);
     Get.lazyPut(() => EmbeddingService(), fenix: true);
+    Get.lazyPut(() => HelperLlmService(), fenix: true);
     Get.lazyPut(() => MemoryService(), fenix: true);
     // Already constructed and recording in main() before bindings run —
     // register that exact instance rather than a fresh one.

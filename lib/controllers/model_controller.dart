@@ -10,6 +10,7 @@ import '../services/model_manager.dart';
 import '../services/llm_service.dart';
 import '../services/chat_storage_service.dart';
 import '../services/embedding_service.dart';
+import '../services/helper_llm_service.dart';
 import '../services/gguf_inspector.dart';
 import '../services/log_service.dart';
 
@@ -18,6 +19,7 @@ class ModelController extends GetxController {
   final LlmService _llm = Get.find<LlmService>();
   final ChatStorageService _storage = Get.find<ChatStorageService>();
   final EmbeddingService _embedding = Get.find<EmbeddingService>();
+  final HelperLlmService _helper = Get.find<HelperLlmService>();
 
   // ── Observable State ──────────────────────────────────────────
   final selectedModelFilename = RxnString();
@@ -41,6 +43,8 @@ class ModelController extends GetxController {
   bool get hasVisionProjector => _llm.hasVisionProjector.value;
   bool get isMemoryModelLoaded => _embedding.isLoaded.value;
   String get loadedMemoryModelFilename => _embedding.loadedModelFilename;
+  bool get isHelperModelLoaded => _helper.isLoaded.value;
+  String get loadedHelperModelFilename => _helper.loadedModelFilename;
 
   @override
   void onInit() {
@@ -493,12 +497,9 @@ class ModelController extends GetxController {
     try {
       final path = _manager.getModelPathByFilename(mmprojFilename);
       await _llm.loadVisionProjector(path);
-      // Honest scope: this pairs the projector at the engine level only.
-      // There is no image-attach control in the chat composer yet, so
-      // don't claim image chat itself is ready to use.
       Get.snackbar(
         'Vision Projector Paired',
-        'Enabled at the engine level. Image attachment in chat isn\'t built yet.',
+        'You can now attach images in chat — look for the image icon next to the message box.',
         snackPosition: SnackPosition.BOTTOM,
         duration: const Duration(seconds: 4),
       );
@@ -529,6 +530,34 @@ class ModelController extends GetxController {
         snackPosition: SnackPosition.BOTTOM,
       );
     }
+  }
+
+  /// Loads a small/fast chat-kind file, in its own separate engine, as the
+  /// dedicated model for background memory extraction — so that background
+  /// task never has to run on (and wait behind) the main chat model.
+  Future<void> setHelperModel(String filename) async {
+    try {
+      final path = _manager.getModelPathByFilename(filename);
+      await _helper.loadModel(path);
+      _storage.helperModelFilename = filename;
+      Get.snackbar(
+        'Helper Model Set',
+        '$filename will handle background memory extraction.',
+        snackPosition: SnackPosition.BOTTOM,
+      );
+    } catch (e) {
+      Get.snackbar(
+        'Load Failed',
+        e.toString(),
+        snackPosition: SnackPosition.BOTTOM,
+      );
+    }
+  }
+
+  /// Unloads the helper model and clears the stored selection.
+  Future<void> clearHelperModel() async {
+    await _helper.unloadModel();
+    _storage.helperModelFilename = '';
   }
 
   /// Get info for a specific filename.

@@ -8,9 +8,11 @@ import '../controllers/theme_controller.dart';
 import '../controllers/model_controller.dart';
 import '../services/local_api_server_service.dart';
 import '../services/model_manager.dart';
+import '../services/gguf_inspector.dart';
 import '../services/background_optimizer_service.dart';
 import '../services/chat_storage_service.dart';
 import '../services/embedding_service.dart';
+import '../services/helper_llm_service.dart';
 import '../services/memory_service.dart';
 import '../services/crash_log_service.dart';
 import '../services/llm_service.dart';
@@ -48,6 +50,7 @@ class _SettingsBody extends StatelessWidget {
     final storage = Get.find<ChatStorageService>();
     final memory = Get.find<MemoryService>();
     final embedding = Get.find<EmbeddingService>();
+    final helper = Get.find<HelperLlmService>();
 
     return Column(
       children: [
@@ -308,7 +311,12 @@ class _SettingsBody extends StatelessWidget {
                 style: TextStyle(fontSize: 12, color: context.textD),
               ),
               const SizedBox(height: 12),
-              _PersistentMemoryCard(storage: storage, memory: memory, embedding: embedding),
+              _PersistentMemoryCard(
+                storage: storage,
+                memory: memory,
+                embedding: embedding,
+                helper: helper,
+              ),
 
               const SizedBox(height: 28),
 
@@ -1198,11 +1206,13 @@ class _PersistentMemoryCard extends StatefulWidget {
   final ChatStorageService storage;
   final MemoryService memory;
   final EmbeddingService embedding;
+  final HelperLlmService helper;
 
   const _PersistentMemoryCard({
     required this.storage,
     required this.memory,
     required this.embedding,
+    required this.helper,
   });
 
   @override
@@ -1287,10 +1297,128 @@ class _PersistentMemoryCardState extends State<_PersistentMemoryCard> {
                   ),
                 ),
               ),
+              const SizedBox(height: 16),
+              Text('Memory Extraction Helper',
+                  style: TextStyle(color: context.text, fontSize: 14)),
+              const SizedBox(height: 4),
+              Text(
+                'A small, fast model dedicated to distilling memorable turns '
+                'into notes — runs in its own engine, separate from the main '
+                'model, so this background task never has to wait for (or '
+                'block) the main conversation. Optional: without one, this '
+                'falls back to the main model, which is slower.',
+                style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+              ),
+              const SizedBox(height: 8),
+              Obx(() {
+                final loaded = widget.helper.isLoaded.value;
+                final filename = widget.helper.loadedModelFilename;
+                return Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        loaded ? filename : 'Not set — using main model',
+                        style: TextStyle(
+                          color: loaded ? context.text : context.textD,
+                          fontSize: 12,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    OutlinedButton(
+                      onPressed: () => _pickHelperModel(context),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: context.text,
+                        side: BorderSide(color: context.border),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                      ),
+                      child: Text(loaded ? 'Change' : 'Set'),
+                    ),
+                    if (loaded) ...[
+                      const SizedBox(width: 8),
+                      IconButton(
+                        icon: const Icon(Icons.close, size: 18),
+                        color: context.textD,
+                        onPressed: () =>
+                            Get.find<ModelController>().clearHelperModel(),
+                        tooltip: 'Stop using a helper model',
+                      ),
+                    ],
+                  ],
+                );
+              }),
             ],
           ),
         );
       }),
+    );
+  }
+
+  void _pickHelperModel(BuildContext context) {
+    final manager = Get.find<ModelManager>();
+    final candidates = manager.downloadedModels
+        .where((f) => manager.kindOf(f) == ModelKind.chat)
+        .toList();
+
+    if (candidates.isEmpty) {
+      Get.snackbar(
+        'No Chat Models Downloaded',
+        'Download a small chat model first to use it as the memory helper.',
+        snackPosition: SnackPosition.BOTTOM,
+      );
+      return;
+    }
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: context.bgPanel,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  'Choose a Helper Model',
+                  style: TextStyle(
+                    color: sheetContext.text,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: candidates.length,
+                  itemBuilder: (_, i) {
+                    final filename = candidates[i];
+                    return ListTile(
+                      leading: Icon(Icons.bolt_rounded, color: sheetContext.textM),
+                      title: Text(
+                        filename,
+                        style: TextStyle(color: sheetContext.text, fontSize: 13),
+                      ),
+                      onTap: () {
+                        Navigator.of(sheetContext).pop();
+                        Get.find<ModelController>().setHelperModel(filename);
+                      },
+                    );
+                  },
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
     );
   }
 

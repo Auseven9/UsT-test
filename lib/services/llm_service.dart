@@ -38,6 +38,16 @@ class LlmService extends GetxService {
   final lastGenerationTokens = 0.obs;
   final lastGenerationSpeed = 0.0.obs;
 
+  /// Whether the most recently completed generation produced (approximately)
+  /// as many tokens as it was allowed to — i.e. it was very likely cut off
+  /// by the maxTokens cap rather than reaching a natural stop. llamadart
+  /// only ever reports finishReason as 'stop' or 'tool_calls', never a
+  /// distinct "hit the length limit" reason, so this is the only signal
+  /// available for that — used by [splitLeakedControlTokens]'s caller to
+  /// decide whether a single leaked marker near the start of the text means
+  /// "cut off mid-thought" versus "one stray tag before a complete answer".
+  final lastGenerationHitTokenCap = false.obs;
+
   // ── Loading progress tracking ──────────────────────────────
   final isLoadingModel = false.obs;
   final loadingProgress = 0.0.obs; // 0.0 to 1.0
@@ -375,15 +385,43 @@ class LlmService extends GetxService {
   /// tokens fits inside the model's real context window. Always keeps at
   /// least the most recent turn, even if it alone doesn't fit, so a single
   /// long message is still sent rather than silently dropped.
-  Future<List<LlamaChatMessage>> fitToContext(
+  ///
+  /// Returns both the trimmed messages AND `responseBudget` — the actual
+  /// number of response tokens that fit alongside that trimmed history.
+  /// Callers MUST use `responseBudget` (clamped to whatever they originally
+  /// wanted) as `GenerationParams.maxTokens`, not their raw requested
+  /// [reserveForResponse] value: when the request only fit by falling back
+  /// to the 25%-of-context floor below, the real remaining budget for a
+  /// response is smaller than what was asked for, and generating with the
+  /// original (too-large) maxTokens would let history+response overrun the
+  /// model's real n_ctx all over again — trimming history alone doesn't
+  /// help if the response cap wasn't trimmed to match.
+  Future<({List<LlamaChatMessage> messages, int responseBudget})> fitToContext(
     List<LlamaChatMessage> messages, {
     int reserveForResponse = 512,
   }) async {
-    if (messages.isEmpty) return messages;
+    if (messages.isEmpty) {
+      return (messages: messages, responseBudget: reserveForResponse);
+    }
 
     final ctx = await getContextSize();
-    final budget = ctx - reserveForResponse;
-    if (budget <= 0) return messages;
+    // If the caller's reserve request (response headroom, plus any image
+    // token allowance) exceeds the model's actual context window — which
+    // happened on every single turn under Android's old 1024-token default
+    // context size once tool schemas and image reserves were added — the
+    // old code gave up on trimming entirely and returned the FULL untrimmed
+    // history. That sent a prompt far bigger than the model's real n_ctx,
+    // which the native engine silently cuts off mid-content during
+    // ingestion — exactly what produced garbled/chopped-looking replies.
+    // Falling back to a guaranteed-positive floor (25% of context) for
+    // history instead means history always gets trimmed to something that
+    // actually fits, and the response budget shrinks to match (see above)
+    // rather than staying at the original, now-too-large request.
+    final rawBudget = ctx - reserveForResponse;
+    final historyBudget =
+        rawBudget > 0 ? rawBudget : (ctx * 0.25).round().clamp(1, ctx);
+    final responseBudget =
+        rawBudget > 0 ? reserveForResponse : (ctx - historyBudget).clamp(1, ctx);
 
     final hasSystem = messages.first.role == LlamaChatRole.system;
     final systemMsg = hasSystem ? messages.first : null;
@@ -396,13 +434,14 @@ class LlmService extends GetxService {
     final keptReversed = <LlamaChatMessage>[];
     for (final msg in turns.reversed) {
       final t = await countTokens(msg.content);
-      if (total + t > budget && keptReversed.isNotEmpty) break;
+      if (total + t > historyBudget && keptReversed.isNotEmpty) break;
       total += t;
       keptReversed.add(msg);
     }
 
     final kept = keptReversed.reversed.toList();
-    return systemMsg != null ? [systemMsg, ...kept] : kept;
+    final fitted = systemMsg != null ? [systemMsg, ...kept] : kept;
+    return (messages: fitted, responseBudget: responseBudget);
   }
 
   /// Generate a chat completion using llamadart's chat-template API.
@@ -463,6 +502,10 @@ class LlmService extends GetxService {
       stopwatch.stop();
       lastGenerationTokens.value = tokenCount;
       lastGenerationSpeed.value = tokensPerSecond.value;
+      // Approximate: within 2 tokens of the requested cap counts as "hit
+      // it" — the exact count can be off by a token or two depending on how
+      // thinking/content/tool-call deltas get chunked.
+      lastGenerationHitTokenCap.value = tokenCount >= params.maxTokens - 2;
       isGenerating.value = false;
     }
   }
@@ -486,11 +529,32 @@ class LlmService extends GetxService {
   /// Returns the original text unchanged (markers stripped) if that heuristic
   /// would discard everything, so a stray tag near the end can never eat a
   /// real answer.
+  ///
+  /// Special case: a SINGLE marker sitting right at the start of [text],
+  /// combined with [wasTruncated] (generation very likely hit its token cap
+  /// rather than reaching a natural stop — see [lastGenerationHitTokenCap])
+  /// means generation was almost certainly cut off before the model ever
+  /// transitioned out of its analysis/thinking channel into a real answer —
+  /// there's no answer to extract, only a partial thought. Dumping that raw
+  /// analysis narrative into the visible reply as if it were the answer is
+  /// worse than being honest that generation didn't finish, so this case
+  /// puts everything into `reasoning` and leaves `answer` empty instead.
+  /// [wasTruncated] gates this deliberately: without it, the exact same
+  /// single-marker-at-the-start shape also matches a model that leaked one
+  /// stray reserved-token tag before an otherwise complete, correct short
+  /// answer — treating that case as "cut off" would hide a real answer
+  /// inside the collapsed Thoughts panel instead of showing it.
   static ({String reasoning, String answer}) splitLeakedControlTokens(
-    String text,
-  ) {
+    String text, {
+    bool wasTruncated = false,
+  }) {
     final matches = _leakedControlTokenPattern.allMatches(text).toList();
     if (matches.isEmpty) return (reasoning: '', answer: text);
+
+    if (wasTruncated && matches.length == 1 && matches.first.start <= 20) {
+      final reasoning = text.replaceAll(_leakedControlTokenPattern, '').trim();
+      return (reasoning: reasoning, answer: '');
+    }
 
     final last = matches.last;
     final answer = text.substring(last.end).trim();
