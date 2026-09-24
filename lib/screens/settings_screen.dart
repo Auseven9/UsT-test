@@ -283,6 +283,13 @@ class _SettingsBody extends StatelessWidget {
 
               const SizedBox(height: 28),
 
+              // ── Context & Sampling ──────────────────────────
+              _sectionHeader(context, 'Context & Sampling'),
+              const SizedBox(height: 8),
+              _GenerationSettingsCard(storage: storage),
+
+              const SizedBox(height: 28),
+
               // ── Hardware Configuration ──────────────────────────
               _sectionHeader(context, 'Hardware Configuration'),
               const SizedBox(height: 8),
@@ -845,6 +852,227 @@ class _SettingsBody extends StatelessWidget {
   }
 }
 
+class _GenerationSettingsCard extends StatefulWidget {
+  final ChatStorageService storage;
+  const _GenerationSettingsCard({required this.storage});
+
+  @override
+  State<_GenerationSettingsCard> createState() => _GenerationSettingsCardState();
+}
+
+class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
+  late int _contextSize;
+  late double _topP;
+  late int _topK;
+  late double _minP;
+  late bool _enableThinking;
+  bool _showAdvanced = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _contextSize = widget.storage.contextSize;
+    _topP = widget.storage.topP;
+    _topK = widget.storage.topK;
+    _minP = widget.storage.minP;
+    _enableThinking = widget.storage.enableModelThinking;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: context.bgPanel,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: context.border),
+      ),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // ── Context size ──
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('Context Size',
+                  style: TextStyle(color: context.text, fontSize: 14)),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: context.bgInput,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  '$_contextSize tokens',
+                  style: TextStyle(color: context.text, fontWeight: FontWeight.bold, fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'How much conversation the model can see at once. Higher uses more '
+            'RAM and takes longer to process on load — reload the model after '
+            'changing this.',
+            style: TextStyle(fontSize: 11, color: context.textD, height: 1.4),
+          ),
+          Slider(
+            value: _contextSize.toDouble(),
+            min: 512,
+            max: 8192,
+            divisions: 15,
+            activeColor: AppColors.accent,
+            inactiveColor: context.border,
+            label: '$_contextSize',
+            // Persist on release, not every tick — this writes to disk
+            // (Hive), and onChanged fires many times per second while
+            // dragging.
+            onChanged: (v) => setState(() => _contextSize = v.round()),
+            onChangeEnd: (v) => widget.storage.contextSize = v.round(),
+          ),
+
+          const SizedBox(height: 8),
+
+          // ── Model thinking toggle ──
+          SwitchListTile(
+            title: Text('Model Reasoning',
+                style: TextStyle(color: context.text, fontSize: 14)),
+            subtitle: Text(
+              'Let reasoning-capable models show their thinking. Off can mean '
+              'faster, shorter replies on models that support toggling it.',
+              style: TextStyle(color: context.textD, fontSize: 11),
+            ),
+            value: _enableThinking,
+            onChanged: (v) {
+              setState(() => _enableThinking = v);
+              widget.storage.enableModelThinking = v;
+            },
+            activeThumbColor: AppColors.accent,
+            contentPadding: EdgeInsets.zero,
+          ),
+
+          const SizedBox(height: 8),
+
+          // ── Advanced sampling toggle ──
+          InkWell(
+            onTap: () => setState(() => _showAdvanced = !_showAdvanced),
+            borderRadius: BorderRadius.circular(8),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(
+                children: [
+                  Icon(
+                    _showAdvanced ? Icons.expand_less : Icons.expand_more,
+                    size: 18,
+                    color: context.textM,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    'Advanced Sampling',
+                    style: TextStyle(
+                      color: context.textM,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          if (_showAdvanced) ...[
+            const SizedBox(height: 12),
+            _samplingSlider(
+              context,
+              label: 'Top-P',
+              value: _topP,
+              min: 0.0,
+              max: 1.0,
+              divisions: 20,
+              display: _topP.toStringAsFixed(2),
+              onChanged: (v) => setState(() => _topP = v),
+              onChangeEnd: (v) => widget.storage.topP = v,
+            ),
+            _samplingSlider(
+              context,
+              label: 'Top-K',
+              value: _topK.toDouble(),
+              min: 0,
+              max: 100,
+              divisions: 100,
+              display: '$_topK',
+              onChanged: (v) => setState(() => _topK = v.round()),
+              onChangeEnd: (v) => widget.storage.topK = v.round(),
+            ),
+            _samplingSlider(
+              context,
+              label: 'Min-P',
+              value: _minP,
+              min: 0.0,
+              max: 0.5,
+              divisions: 25,
+              display: _minP.toStringAsFixed(2),
+              onChanged: (v) => setState(() => _minP = v),
+              onChangeEnd: (v) => widget.storage.minP = v,
+            ),
+            Text(
+              'These narrow which tokens the model can pick from at each step. '
+              'Defaults (Top-P 0.95, Top-K 40, Min-P 0.05) are sane for most '
+              'models — only change these if you know what you\'re tuning.',
+              style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _samplingSlider(
+    BuildContext context, {
+    required String label,
+    required double value,
+    required double min,
+    required double max,
+    required int divisions,
+    required String display,
+    required ValueChanged<double> onChanged,
+    required ValueChanged<double> onChangeEnd,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 56,
+            child: Text(label, style: TextStyle(color: context.text, fontSize: 13)),
+          ),
+          Expanded(
+            child: Slider(
+              value: value,
+              min: min,
+              max: max,
+              divisions: divisions,
+              activeColor: AppColors.accent,
+              inactiveColor: context.border,
+              label: display,
+              onChanged: onChanged,
+              onChangeEnd: onChangeEnd,
+            ),
+          ),
+          SizedBox(
+            width: 40,
+            child: Text(
+              display,
+              textAlign: TextAlign.end,
+              style: TextStyle(color: context.textM, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _PersistentMemoryCard extends StatefulWidget {
   final ChatStorageService storage;
   final MemoryService memory;
@@ -971,38 +1199,28 @@ class _HardwareSettingsCardState extends State<_HardwareSettingsCard> {
   late double _gpuLayers;
   bool _showManual = false;
 
-  // Auto-detect the best backend and GPU layers for this device
+  // Recommended backend for this device.
+  //
+  // This used to guess GPU (OpenCL, 33 layers) for any 8+ core Android
+  // device on core-count alone, with no check that OpenCL actually works —
+  // there's no public API to verify that before trying. That guess is
+  // exactly what produced a "Recommended" config that ran at ~1 t/s on a
+  // real device: the SoC had cores, but nothing confirmed the GPU backend
+  // was doing real work rather than silently falling back or thrashing.
+  //
+  // CPU is now always the recommendation — it's the one backend that
+  // reliably works everywhere. GPU backends are still available, but only
+  // as an explicit, clearly-labeled opt-in under Manual Override below.
   static Map<String, dynamic> _detectBestConfig() {
-    if (!Platform.isAndroid && !Platform.isIOS) {
-      // Desktop: CPU is safest, Vulkan if available
-      return {'backend': 'cpu', 'gpuLayers': 0, 'reason': 'CPU mode — most compatible on desktop'};
-    }
-
-    // Android/iOS: detect available RAM and processor count
     final cores = Platform.numberOfProcessors;
-    
-    if (cores >= 8) {
-      // High-end device (e.g. Snapdragon 8 Gen 2+, Dimensity 9000+)
-      return {
-        'backend': 'opencl',
-        'gpuLayers': 33,
-        'reason': 'OpenCL GPU — best for high-end SoC ($cores cores detected)',
-      };
-    } else if (cores >= 6) {
-      // Mid-range device
-      return {
-        'backend': 'cpu',
-        'gpuLayers': 0,
-        'reason': 'CPU mode — safe for mid-range devices ($cores cores)',
-      };
-    } else {
-      // Low-end device
-      return {
-        'backend': 'cpu',
-        'gpuLayers': 0,
-        'reason': 'CPU mode — optimized for lower-end devices ($cores cores)',
-      };
-    }
+    return {
+      'backend': 'cpu',
+      'gpuLayers': 0,
+      'reason': 'CPU mode — reliably works on every device ($cores cores '
+          'detected). GPU backends (Vulkan/OpenCL) aren\'t verified to work '
+          'on this specific device — try one manually below if you want to, '
+          'but a slow or unstable result usually means it isn\'t.',
+    };
   }
 
   @override

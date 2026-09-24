@@ -11,6 +11,17 @@ import 'log_service.dart';
 import 'crash_log_service.dart';
 import 'gguf_inspector.dart';
 
+/// A single streamed piece of a generation — `content` is the visible
+/// answer text, `thinking` is reasoning/chain-of-thought llamadart's chat
+/// template engine separated out (empty when the model doesn't reason, or
+/// when its template wasn't recognized — see
+/// [LlmService.splitLeakedControlTokens] for that case).
+class GenerationChunk {
+  final String content;
+  final String thinking;
+  const GenerationChunk({this.content = '', this.thinking = ''});
+}
+
 /// Wraps llamadart's LlamaEngine for model loading, generation, and lifecycle.
 class LlmService extends GetxService {
   LlamaEngine? _engine;
@@ -187,13 +198,16 @@ class LlmService extends GetxService {
         return;
       }
 
-      // Use smaller context on Android to prevent OOM kills.
-      // Desktop can handle 2048, but Android devices with limited RAM
-      // need 1024 to avoid the Low Memory Killer (LMK).
-      final contextSize = Platform.isAndroid ? 1024 : 2048;
+      // User-configurable now (Settings → Context Size) instead of a silent
+      // hardcoded platform constant. Still worth knowing: a large context on
+      // a RAM-constrained Android device risks the Low Memory Killer — the
+      // slider's own UI carries that warning rather than silently capping it
+      // here, since not applying the value the user actually chose is its
+      // own kind of bug.
+      final storage = Get.find<ChatStorageService>();
+      final contextSize = storage.contextSize;
 
       // Map the string backend to GpuBackend enum
-      final storage = Get.find<ChatStorageService>();
       GpuBackend parsedBackend;
       switch (storage.backendType) {
         case 'vulkan':
@@ -344,9 +358,20 @@ class LlmService extends GetxService {
   }
 
   /// Generate a chat completion using llamadart's chat-template API.
-  Stream<String> generateChatCompletion({
+  ///
+  /// Yields [GenerationChunk]s with `content` and `thinking` kept separate —
+  /// llamadart's engine correctly splits these itself for templates it
+  /// recognizes (Hermes/Qwen `<think>`, GPT-OSS `<|channel|>`, etc). For a
+  /// model whose template *isn't* recognized (custom/community fine-tunes
+  /// often ship a hand-modified or outright malformed template), nothing
+  /// gets split and raw control-token-like text ends up in `content` — set
+  /// [enableThinking] to steer templates that support toggling it, and see
+  /// [splitLeakedControlTokens] for the defensive fallback callers should
+  /// run over the final accumulated content.
+  Stream<GenerationChunk> generateChatCompletion({
     required List<LlamaChatMessage> messages,
     GenerationParams params = const GenerationParams(),
+    bool enableThinking = true,
   }) async* {
     if (_engine == null || !isLoaded.value) {
       throw StateError('No model loaded. Call loadModel() first.');
@@ -365,17 +390,19 @@ class LlmService extends GetxService {
         messages,
         params: params,
         toolChoice: ToolChoice.none,
+        enableThinking: enableThinking,
       )) {
         final choice = chunk.choices.isNotEmpty ? chunk.choices.first : null;
-        final content = choice?.delta.content;
-        if (content == null || content.isEmpty) continue;
+        final content = choice?.delta.content ?? '';
+        final thinking = choice?.delta.thinking ?? '';
+        if (content.isEmpty && thinking.isEmpty) continue;
 
         tokenCount++;
         if (stopwatch.elapsedMilliseconds > 0) {
           tokensPerSecond.value =
               tokenCount / (stopwatch.elapsedMilliseconds / 1000);
         }
-        yield content;
+        yield GenerationChunk(content: content, thinking: thinking);
       }
     } finally {
       stopwatch.stop();
@@ -383,6 +410,46 @@ class LlmService extends GetxService {
       lastGenerationSpeed.value = tokensPerSecond.value;
       isGenerating.value = false;
     }
+  }
+
+  /// Matches things that look like leaked chat-template control tokens —
+  /// `<|channel|>`, `<|start|>`, malformed single-pipe variants like
+  /// `<|channel>` / `<channel|>`. Requires a `|` adjacent to a bracket on
+  /// at least one side — that's what makes this a control-token pattern and
+  /// not just "any bracketed word", which would also match ordinary
+  /// placeholders and generic types in real answers like `<YOUR_API_KEY>`
+  /// or `List<String>`. Neither of those contains a pipe, so neither matches.
+  static final RegExp _leakedControlTokenPattern = RegExp(
+    r'<\|[A-Za-z_][A-Za-z0-9_]{0,24}\|?>|<[A-Za-z_][A-Za-z0-9_]{0,24}\|>',
+  );
+
+  /// Best-effort safety net for a model whose chat template isn't recognized
+  /// by llamadart's format detector (see [generateChatCompletion]'s doc) —
+  /// NOT a real parser, just a heuristic: if any control-token-like marker
+  /// appears in [text], treat everything up to and including the *last* one
+  /// as hidden reasoning and surface only what follows as the real answer.
+  /// Returns the original text unchanged (markers stripped) if that heuristic
+  /// would discard everything, so a stray tag near the end can never eat a
+  /// real answer.
+  static ({String reasoning, String answer}) splitLeakedControlTokens(
+    String text,
+  ) {
+    final matches = _leakedControlTokenPattern.allMatches(text).toList();
+    if (matches.isEmpty) return (reasoning: '', answer: text);
+
+    final last = matches.last;
+    final answer = text.substring(last.end).trim();
+    if (answer.isEmpty) {
+      return (
+        reasoning: '',
+        answer: text.replaceAll(_leakedControlTokenPattern, '').trim(),
+      );
+    }
+    final reasoning = text
+        .substring(0, last.end)
+        .replaceAll(_leakedControlTokenPattern, '')
+        .trim();
+    return (reasoning: reasoning, answer: answer);
   }
 
   /// Pair a CLIP vision projector (mmproj file) with the currently loaded

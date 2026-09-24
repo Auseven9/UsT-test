@@ -274,11 +274,11 @@ class LocalApiServerService extends GetxService {
     final id = _completionId();
     final buffer = StringBuffer();
 
-    await for (final token in _llm.generateChatCompletion(
+    await for (final chunk in _llm.generateChatCompletion(
       messages: request.messages,
       params: request.params,
     )) {
-      buffer.write(token);
+      buffer.write(chunk.content);
     }
 
     final content = buffer.toString().trim();
@@ -322,13 +322,20 @@ class LocalApiServerService extends GetxService {
     );
 
     try {
-      await for (final token in _llm.generateChatCompletion(
+      await for (final chunk in _llm.generateChatCompletion(
         messages: request.messages,
         params: request.params,
       )) {
-        if (token.isEmpty) continue;
+        if (chunk.thinking.isNotEmpty) {
+          writeEvent(_streamChunk(
+            id: id,
+            created: created,
+            delta: {'reasoning_content': chunk.thinking},
+          ));
+        }
+        if (chunk.content.isEmpty) continue;
         writeEvent(
-          _streamChunk(id: id, created: created, delta: {'content': token}),
+          _streamChunk(id: id, created: created, delta: {'content': chunk.content}),
         );
       }
 

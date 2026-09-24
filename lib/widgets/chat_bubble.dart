@@ -71,6 +71,8 @@ class ChatBubble extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        if (message.reasoning != null && message.reasoning!.isNotEmpty)
+          _ThoughtsSection(reasoning: message.reasoning!),
         Padding(
           padding: const EdgeInsets.only(top: 3),
           child: MarkdownBody(
@@ -171,6 +173,79 @@ class ChatBubble extends StatelessWidget {
             ),
           ),
       ],
+    );
+  }
+}
+
+/// Collapsed-by-default "Thoughts" panel for a message's reasoning content
+/// — kept visually distinct and out of the way by default, since raw
+/// chain-of-thought is rarely what someone wants to read first, but still
+/// available for anyone who wants to see how the model got to its answer.
+class _ThoughtsSection extends StatefulWidget {
+  final String reasoning;
+  const _ThoughtsSection({required this.reasoning});
+
+  @override
+  State<_ThoughtsSection> createState() => _ThoughtsSectionState();
+}
+
+class _ThoughtsSectionState extends State<_ThoughtsSection> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: BoxDecoration(
+        color: context.bgHover.withOpacity(0.5),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: context.borderFaint),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            borderRadius: BorderRadius.circular(8),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              child: Row(
+                children: [
+                  Icon(
+                    _expanded ? Icons.expand_less : Icons.expand_more,
+                    size: 16,
+                    color: context.textD,
+                  ),
+                  const SizedBox(width: 6),
+                  Icon(Icons.psychology_outlined, size: 14, color: context.textD),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Thoughts',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: context.textD,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_expanded)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+              child: Text(
+                widget.reasoning,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  color: context.textM,
+                  height: 1.5,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 }

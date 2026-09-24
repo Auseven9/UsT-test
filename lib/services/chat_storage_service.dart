@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:get/get.dart';
 import 'package:hive/hive.dart';
 
@@ -124,4 +126,44 @@ class ChatStorageService extends GetxService {
 
   set memoryEmbeddingModelFilename(String value) =>
       _settingsBox.put('memory_embedding_model', value);
+
+  // ── Context & Sampling ──────────────────────────────────────
+
+  /// Context window size (n_ctx) applied at model load time. Defaults match
+  /// the old hardcoded per-platform values (1024 on Android — smaller,
+  /// specifically to avoid the Low Memory Killer on RAM-constrained
+  /// devices — 2048 elsewhere) for anyone who hasn't touched the new
+  /// slider yet, rather than silently doubling an existing Android user's
+  /// effective context on their next model load after upgrading.
+  int get contextSize => (_settingsBox.get(
+        'context_size',
+        defaultValue: Platform.isAndroid ? 1024 : 2048,
+      ) as num)
+          .toInt();
+
+  set contextSize(int value) => _settingsBox.put('context_size', value);
+
+  double get topP =>
+      (_settingsBox.get('top_p', defaultValue: 0.95) as num).toDouble();
+
+  set topP(double value) => _settingsBox.put('top_p', value);
+
+  int get topK => (_settingsBox.get('top_k', defaultValue: 40) as num).toInt();
+
+  set topK(int value) => _settingsBox.put('top_k', value);
+
+  double get minP =>
+      (_settingsBox.get('min_p', defaultValue: 0.05) as num).toDouble();
+
+  set minP(double value) => _settingsBox.put('min_p', value);
+
+  /// Whether to instruct the model's chat template to produce visible
+  /// reasoning (for templates that support toggling it). Off can mean
+  /// faster, shorter responses on reasoning-tuned models — and side-steps
+  /// leaking raw thinking text for templates that don't separate it cleanly.
+  bool get enableModelThinking =>
+      _settingsBox.get('enable_model_thinking', defaultValue: true) as bool;
+
+  set enableModelThinking(bool value) =>
+      _settingsBox.put('enable_model_thinking', value);
 }

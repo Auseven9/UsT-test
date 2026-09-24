@@ -11,13 +11,14 @@ import '../services/memory_service.dart';
 
 /// Hard safety cap on a single response, independent of context size —
 /// bounds worst-case generation time/battery drain if a model never
-/// produces a natural stop token, without limiting normal replies (well
-/// above what a typical chat turn needs).
-const _maxResponseTokens = 1024;
+/// produces a natural stop token. Reasoning models can easily burn several
+/// hundred tokens of chain-of-thought before ever reaching an answer, so
+/// this leaves real headroom rather than the flat 1024 it used to be.
+const _maxResponseTokens = 2048;
 
-/// How many recent turns worth of tokens the drop-summarization prompt
-/// itself is allowed to use for its own (short) output.
-const _summaryMaxTokens = 200;
+/// How many tokens the per-turn memory-extraction prompt is allowed for its
+/// own (short) output.
+const _extractionMaxTokens = 200;
 
 class ChatController extends GetxController {
   final LlmService _llm = Get.find<LlmService>();
@@ -29,6 +30,7 @@ class ChatController extends GetxController {
   final activeChatId = RxnString();
   final isGenerating = false.obs;
   final streamedResponse = ''.obs;
+  final streamedReasoning = ''.obs;
   final temperature = 0.7.obs;
   final systemPrompt = ''.obs;
 
@@ -150,22 +152,14 @@ class ChatController extends GetxController {
     // stops being true.
     final fitted =
         await _llm.fitToContext(history, reserveForResponse: _maxResponseTokens);
-    final hasSystemMsg =
-        history.isNotEmpty && history.first.role == LlamaChatRole.system;
-    final droppedCount = history.length - fitted.length;
-    final droppedTurns = droppedCount > 0
-        ? history.sublist(
-            hasSystemMsg ? 1 : 0,
-            (hasSystemMsg ? 1 : 0) + droppedCount,
-          )
-        : const <LlamaChatMessage>[];
 
-    // A background memory-summarization call (fired after a previous
-    // message, see _summarizeAndRemember) may still be occupying the
-    // engine's single generation slot. It's deliberately short, so wait
-    // briefly for it to clear instead of letting generateChatCompletion's
-    // StateError surface as a confusing "Another generation is already in
-    // progress" chat error for something the user never saw start.
+    // A background memory-extraction call (see _rememberFromTurn, fired
+    // after every previous message now, not just on context eviction) may
+    // still be occupying the engine's single generation slot. It's
+    // deliberately short, so wait briefly for it to clear instead of
+    // letting generateChatCompletion's StateError surface as a confusing
+    // "Another generation is already in progress" chat error for something
+    // the user never saw start.
     var waitedMs = 0;
     while (_llm.isGenerating.value && waitedMs < 5000) {
       await Future.delayed(const Duration(milliseconds: 100));
@@ -175,6 +169,7 @@ class ChatController extends GetxController {
     // Start generation
     isGenerating.value = true;
     streamedResponse.value = '';
+    streamedReasoning.value = '';
 
     final aiMsg = MessageModel(role: MessageRole.assistant, content: '');
     chat.messages.add(aiMsg);
@@ -186,12 +181,22 @@ class ChatController extends GetxController {
         params: GenerationParams(
           temp: temperature.value,
           maxTokens: _maxResponseTokens,
+          topP: _storage.topP,
+          topK: _storage.topK,
+          minP: _storage.minP,
         ),
+        enableThinking: _storage.enableModelThinking,
       );
 
-      await for (final token in stream) {
-        streamedResponse.value += token;
-        aiMsg.content = streamedResponse.value;
+      await for (final chunk in stream) {
+        if (chunk.thinking.isNotEmpty) {
+          streamedReasoning.value += chunk.thinking;
+          aiMsg.reasoning = streamedReasoning.value;
+        }
+        if (chunk.content.isNotEmpty) {
+          streamedResponse.value += chunk.content;
+          aiMsg.content = streamedResponse.value;
+        }
         // Throttle UI refreshes
         chats.refresh();
       }
@@ -200,66 +205,101 @@ class ChatController extends GetxController {
         aiMsg.content = '⚠ Error: ${e.toString()}';
       }
     } finally {
+      // Defensive fallback for a model whose chat template llamadart didn't
+      // recognize (native `thinking` stayed empty even though this specific
+      // reply clearly reasoned before answering): split any leaked
+      // control-token-looking text out of the final content rather than
+      // showing it raw. A no-op when native separation already worked.
+      if ((aiMsg.reasoning == null || aiMsg.reasoning!.isEmpty) &&
+          aiMsg.content.isNotEmpty) {
+        final split = LlmService.splitLeakedControlTokens(aiMsg.content);
+        if (split.reasoning.isNotEmpty) {
+          aiMsg.reasoning = split.reasoning;
+          aiMsg.content = split.answer;
+        }
+      }
       aiMsg.content = aiMsg.content.trim();
       isGenerating.value = false;
       streamedResponse.value = '';
+      streamedReasoning.value = '';
       chat.updatedAt = DateTime.now();
       _storage.saveChat(chat);
       chats.refresh();
     }
 
-    // Fire-and-forget: if the sliding window just pushed history out of the
-    // model's context, distill it into a memory note before it's gone for
-    // good, so it can still surface in a later conversation. Never blocks
-    // or fails the visible response above.
+    // Fire-and-forget: distill *this* exchange into a memory note as soon as
+    // it happens, rather than waiting for the sliding window to evict it
+    // later — memory should reflect what the user just said, not just what
+    // eventually got old. Never blocks or fails the visible response above.
     if (_storage.persistentMemoryEnabled &&
-        droppedTurns.isNotEmpty &&
+        aiMsg.content.isNotEmpty &&
         _embedding.isLoaded.value) {
-      unawaited(_summarizeAndRemember(droppedTurns, chat.id));
+      unawaited(_rememberFromTurn(userMsg, aiMsg, chat.id));
     }
   }
 
-  /// Summarizes a block of about-to-be-dropped conversation turns into a
-  /// short memory note, embeds it, and persists it — best-effort throughout;
-  /// any failure here is silent since it must never surface as a chat error.
-  Future<void> _summarizeAndRemember(
-    List<LlamaChatMessage> droppedTurns,
+  /// Looks at the latest user+assistant exchange and, if it contains
+  /// anything worth remembering long-term, distills it into a memory note,
+  /// embeds it, and persists it — best-effort throughout; any failure here
+  /// is silent since it must never surface as a chat error. Runs after
+  /// every turn (not just when the sliding window evicts one) so memory
+  /// reflects what was just said, not just what's about to be forgotten.
+  Future<void> _rememberFromTurn(
+    MessageModel userMsg,
+    MessageModel aiMsg,
     String chatId,
   ) async {
     try {
       if (!_llm.isLoaded.value || _llm.isGenerating.value) return;
 
-      final summaryRequest = <LlamaChatMessage>[
+      final extractionRequest = <LlamaChatMessage>[
         LlamaChatMessage.fromText(
           role: LlamaChatRole.system,
-          text: 'You distill conversation excerpts into short-term memory '
-              'notes. Given the excerpt below, write 2-4 concise bullet '
-              'points capturing only facts, preferences, or context worth '
-              'remembering long-term. If there is nothing worth '
-              'remembering, respond with exactly: NONE',
+          text: 'You watch a conversation and extract durable facts or '
+              'preferences worth remembering in future, unrelated '
+              'conversations — things like the user\'s name, stated '
+              'preferences, ongoing projects, or personal details. Given the '
+              'exchange below, write ONE short sentence capturing anything '
+              'worth remembering, or respond with exactly NONE if there is '
+              'nothing durable (small talk, one-off questions, and the '
+              'model\'s own replies don\'t count).',
         ),
-        ...droppedTurns,
+        LlamaChatMessage.fromText(role: LlamaChatRole.user, text: userMsg.content),
+        LlamaChatMessage.fromText(
+          role: LlamaChatRole.assistant,
+          text: aiMsg.content,
+        ),
         LlamaChatMessage.fromText(
           role: LlamaChatRole.user,
-          text: 'Summarize the excerpt above for long-term memory.',
+          text: 'Extract anything worth remembering from the exchange above, '
+              'in one sentence, or respond NONE.',
         ),
       ];
 
       final buffer = StringBuffer();
-      await for (final token in _llm.generateChatCompletion(
-        messages: summaryRequest,
-        params: const GenerationParams(temp: 0.3, maxTokens: _summaryMaxTokens),
+      await for (final chunk in _llm.generateChatCompletion(
+        messages: extractionRequest,
+        params: const GenerationParams(
+          temp: 0.2,
+          maxTokens: _extractionMaxTokens,
+        ),
+        enableThinking: false,
       )) {
-        buffer.write(token);
+        buffer.write(chunk.content);
       }
 
-      final summary = buffer.toString().trim();
-      if (summary.isEmpty || summary.toUpperCase() == 'NONE') return;
+      final extracted = buffer.toString().trim();
+      // Exact match on the sentinel only — a real extracted fact can
+      // legitimately contain the word "none" (e.g. "has none of the common
+      // allergies"), and .contains('NONE') would wrongly discard that.
+      if (extracted.isEmpty || extracted.toUpperCase() == 'NONE') {
+        return;
+      }
 
-      final vector = await _embedding.embed(summary);
+      final vector = await _embedding.embed(extracted);
       if (vector == null) return;
 
-      await _memory.add(summary, vector, sourceChatId: chatId);
+      await _memory.add(extracted, vector, sourceChatId: chatId);
     } catch (_) {
       // Best-effort background task — never let this affect the chat UI.
     }
