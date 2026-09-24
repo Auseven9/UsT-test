@@ -204,6 +204,23 @@ class _ModelLibraryBodyState extends State<_ModelLibraryBody> {
                   );
                   final dlState = manager.getDownloadState(model.filename);
 
+                  // A downloaded vision-projector/embedding/LoRA file needs
+                  // its own card, not the generic "Load Model" one — this
+                  // was previously only applied to files ctrl.kindOf() found
+                  // on disk outside the catalog, so every custom/imported
+                  // entry (the actual "Import" button's own output) fell
+                  // through to the plain ModelCard below regardless of what
+                  // it actually was.
+                  final special = isDl
+                      ? _specialCardForKind(
+                          context, ctrl, model.filename, model.kind)
+                      : null;
+                  if (special != null) {
+                    return special
+                        .animate()
+                        .fadeIn(delay: Duration(milliseconds: index * 50), duration: 250.ms);
+                  }
+
                   return Column(
                     children: [
                       ModelCard(
@@ -271,13 +288,19 @@ class _ModelLibraryBodyState extends State<_ModelLibraryBody> {
     );
   }
 
-  Widget _localFileCard(
+  /// Card for a vision-projector/embedding/LoRA file, or null for a plain
+  /// chat model (or unclassified file) — callers fall back to their own
+  /// normal rendering in that case. Shared between the "local file not in
+  /// catalog" list and the main catalog list, so a non-chat file gets the
+  /// right card *regardless of which of those two lists it happens to be
+  /// in* (custom/imported entries live in the catalog, not the local-file
+  /// fallback — the two must never render a kind differently).
+  Widget? _specialCardForKind(
     BuildContext context,
     ModelController ctrl,
     String filename,
+    ModelKind kind,
   ) {
-    final kind = ctrl.kindOf(filename);
-
     switch (kind) {
       case ModelKind.visionProjector:
         return _specialFileCard(
@@ -316,7 +339,20 @@ class _ModelLibraryBodyState extends State<_ModelLibraryBody> {
         );
       case ModelKind.chat:
       case ModelKind.unknown:
-        return Container(
+        return null;
+    }
+  }
+
+  Widget _localFileCard(
+    BuildContext context,
+    ModelController ctrl,
+    String filename,
+  ) {
+    final kind = ctrl.kindOf(filename);
+    final special = _specialCardForKind(context, ctrl, filename, kind);
+    if (special != null) return special;
+
+    return Container(
           margin: const EdgeInsets.only(bottom: 8),
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
@@ -356,7 +392,6 @@ class _ModelLibraryBodyState extends State<_ModelLibraryBody> {
             ],
           ),
         );
-    }
   }
 
   /// Card for a non-chat `.gguf` file (vision projector, embedding model,
