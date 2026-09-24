@@ -1,3 +1,5 @@
+import '../services/gguf_inspector.dart';
+
 /// Represents a downloadable/loadable AI model from the catalog.
 class AiModelInfo {
   final String id;
@@ -11,6 +13,12 @@ class AiModelInfo {
   final String systemPrompt;
   final bool recommended;
 
+  /// What this file actually is (chat model, vision projector, embedding
+  /// model, LoRA adapter). Catalog entries are always [ModelKind.chat];
+  /// locally-discovered files are classified by [GgufInspector] and this
+  /// field is filled in by [ModelManager] after that scan.
+  final ModelKind kind;
+
   const AiModelInfo({
     required this.id,
     required this.name,
@@ -22,6 +30,7 @@ class AiModelInfo {
     required this.badge,
     required this.systemPrompt,
     this.recommended = false,
+    this.kind = ModelKind.chat,
   });
 
   factory AiModelInfo.fromJson(Map<String, dynamic> json) {
@@ -36,6 +45,10 @@ class AiModelInfo {
       badge: json['badge'] as String? ?? '',
       systemPrompt: json['systemPrompt'] as String? ?? '',
       recommended: json['recommended'] as bool? ?? false,
+      kind: ModelKind.values.firstWhere(
+        (k) => k.name == json['kind'],
+        orElse: () => ModelKind.chat,
+      ),
     );
   }
 
@@ -50,9 +63,25 @@ class AiModelInfo {
         'badge': badge,
         'systemPrompt': systemPrompt,
         'recommended': recommended,
+        'kind': kind.name,
       };
+
+  AiModelInfo copyWith({ModelKind? kind}) => AiModelInfo(
+        id: id,
+        name: name,
+        filename: filename,
+        url: url,
+        sizeGb: sizeGb,
+        minRamGb: minRamGb,
+        label: label,
+        badge: badge,
+        systemPrompt: systemPrompt,
+        recommended: recommended,
+        kind: kind ?? this.kind,
+      );
 
   bool get isUncensored => label == 'UNCENSORED';
   bool get isStandard => label == 'STANDARD';
   bool get isCustom => label == 'CUSTOM';
+  bool get isChatModel => kind == ModelKind.chat;
 }

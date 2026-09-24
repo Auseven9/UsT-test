@@ -9,6 +9,8 @@ import '../services/chat_storage_service.dart';
 import '../services/local_api_server_service.dart';
 import '../services/wakelock_service.dart';
 import '../services/log_service.dart';
+import '../services/embedding_service.dart';
+import '../services/memory_service.dart';
 import '../services/background_optimizer_service.dart';
 import '../routes/app_routes.dart';
 
@@ -39,11 +41,33 @@ class _SplashScreenState extends State<SplashScreen> {
 
       setState(() => _status = 'Loading model catalog...');
       log.info('Loading model catalog...', source: 'Splash');
-      await Get.find<ModelManager>().init();
+      final modelManager = await Get.find<ModelManager>().init();
 
       setState(() => _status = 'Preparing AI engine...');
       log.info('Preparing AI engine...', source: 'Splash');
       await Get.find<LlmService>().init();
+
+      setState(() => _status = 'Setting up memory...');
+      log.info('Setting up persistent memory...', source: 'Splash');
+      final memory = await Get.find<MemoryService>().init();
+      final embedding = await Get.find<EmbeddingService>().init();
+      log.info('${memory.entries.length} memories loaded', source: 'Splash');
+
+      // Restore the embedding model across restarts, same as the local API
+      // server restores its own enabled state — otherwise persistent memory
+      // would silently stop retrieving anything after every app relaunch.
+      final storage = Get.find<ChatStorageService>();
+      if (storage.persistentMemoryEnabled &&
+          storage.memoryEmbeddingModelFilename.isNotEmpty) {
+        try {
+          final path = modelManager.getModelPathByFilename(
+            storage.memoryEmbeddingModelFilename,
+          );
+          await embedding.loadModel(path);
+        } catch (e) {
+          log.error('Could not restore embedding model: $e', source: 'Splash');
+        }
+      }
 
       setState(() => _status = 'Preparing local API...');
       log.info('Preparing local API...', source: 'Splash');

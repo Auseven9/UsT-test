@@ -8,6 +8,8 @@ import 'package:path/path.dart' as p;
 import 'wakelock_service.dart';
 import 'chat_storage_service.dart';
 import 'log_service.dart';
+import 'crash_log_service.dart';
+import 'gguf_inspector.dart';
 
 /// Wraps llamadart's LlamaEngine for model loading, generation, and lifecycle.
 class LlmService extends GetxService {
@@ -26,6 +28,10 @@ class LlmService extends GetxService {
   final loadingProgress = 0.0.obs; // 0.0 to 1.0
   final loadingStatusMsg = ''.obs;
   bool _loadingCancelled = false;
+
+  /// Whether a vision projector (mmproj) is currently paired with the loaded
+  /// chat model, enabling image input.
+  final hasVisionProjector = false.obs;
 
   StreamSubscription? _generateSub;
 
@@ -71,6 +77,34 @@ class LlmService extends GetxService {
     }
 
     final filename = p.basename(path);
+
+    // Validate the file BEFORE handing it to the native engine — a
+    // corrupted/truncated file or a non-chat GGUF (vision projector,
+    // embedding model, LoRA adapter) reaching llama.cpp's loader is exactly
+    // the kind of input that produces a hard native crash instead of a
+    // catchable Dart exception. Reject it here with a clear message instead.
+    final meta = await GgufInspector.inspect(path);
+    if (meta.kind == ModelKind.unknown) {
+      log?.error('Not a valid GGUF file: $filename', source: 'LLM');
+      CrashLogService.instance.record(
+        'model_load',
+        'Rejected invalid/corrupted GGUF file before native load',
+        context: 'file=$filename',
+      );
+      throw Exception(
+        '"$filename" doesn\'t look like a valid GGUF file (its header '
+        'couldn\'t be read). It may be corrupted or incomplete.',
+      );
+    }
+    if (meta.kind != ModelKind.chat) {
+      log?.error('Refusing to load non-chat GGUF as a model: $filename (${meta.kind})',
+          source: 'LLM');
+      throw Exception(
+        '"$filename" is a ${_kindLabel(meta.kind)}, not a chat model — it '
+        'can\'t be loaded this way.',
+      );
+    }
+
     log?.info('Loading model: $filename', source: 'LLM');
 
     _loadingCancelled = false;
@@ -103,11 +137,17 @@ class LlmService extends GetxService {
     try {
       _backend = LlamaBackend();
       _engine = LlamaEngine(_backend!);
-    } catch (e) {
+    } catch (e, stack) {
       _backend = null;
       _engine = null;
       _resetLoadingState();
       log?.error('Engine init failed: $e', source: 'LLM');
+      CrashLogService.instance.record(
+        'model_load',
+        'Native engine initialization failed: $e',
+        stackTrace: stack.toString(),
+        context: 'file=$filename',
+      );
       throw Exception(
         'Failed to initialize AI engine. '
         'This may be a device compatibility issue. '
@@ -169,16 +209,25 @@ class LlmService extends GetxService {
       // Read gpu layers
       final userGpuLayers = storage.gpuLayers;
 
-      // Optimize threads: 4 for both generation and batch processing to keep memory stable.
+      // Scale worker threads with the device's actual core count instead of
+      // flatlining at 4 for anything above it. Devices with 8+ cores were
+      // leaving real throughput on the table under the old flat cap. Still
+      // capped (at 8) rather than using every core, to leave headroom for
+      // the OS and UI thread and avoid a thermal-throttle spiral. 0 below 5
+      // cores means "let llama.cpp auto-detect", which is safer than a fixed
+      // guess on low-core devices.
+      final cores = Platform.numberOfProcessors;
+      final threads = cores <= 4 ? 0 : (cores * 3 / 4).round().clamp(4, 8);
+
       final params = ModelParams(
         contextSize: contextSize,
-        gpuLayers: userGpuLayers, 
+        gpuLayers: userGpuLayers,
         preferredBackend: parsedBackend,
-        numberOfThreads: Platform.numberOfProcessors > 4 ? 4 : 0, 
-        numberOfThreadsBatch: Platform.numberOfProcessors > 4 ? 4 : 0,
+        numberOfThreads: threads,
+        numberOfThreadsBatch: threads,
       );
 
-      log?.info('Backend=$parsedBackend, GPU layers=$userGpuLayers, ctx=$contextSize, threads=${Platform.numberOfProcessors > 4 ? 4 : 0}', source: 'LLM');
+      log?.info('Backend=$parsedBackend, GPU layers=$userGpuLayers, ctx=$contextSize, threads=$threads (cores=$cores)', source: 'LLM');
 
       await _engine!.loadModel(path, modelParams: params);
       progressTimer.cancel();
@@ -202,21 +251,37 @@ class LlmService extends GetxService {
 
       // Brief delay to show 100%
       await Future.delayed(const Duration(milliseconds: 300));
-    } catch (e) {
+    } catch (e, stack) {
       isLoaded.value = false;
       loadedModelPath.value = '';
       await _fullTeardown();
       log?.error('Model load failed: $e', source: 'LLM');
+      CrashLogService.instance.record(
+        'model_load',
+        'Model load failed: $e',
+        stackTrace: stack.toString(),
+        context: 'file=$filename',
+      );
 
-      // Provide a clearer error message for common Android failures
-      if (Platform.isAndroid) {
-        final errStr = e.toString().toLowerCase();
-        if (errStr.contains('memory') || errStr.contains('alloc')) {
-          throw Exception(
-            'Not enough RAM to load this model. '
-            'Try a smaller model (e.g. Gemma 2 2B at 1.6 GB).',
-          );
-        }
+      // Provide a clearer, more specific error for common failure classes
+      // instead of surfacing the raw native/FFI error string to the user.
+      final errStr = e.toString().toLowerCase();
+      if (Platform.isAndroid &&
+          (errStr.contains('memory') || errStr.contains('alloc'))) {
+        throw Exception(
+          'Not enough RAM to load this model. '
+          'Try a smaller model (e.g. Gemma 2 2B at 1.6 GB).',
+        );
+      }
+      if (errStr.contains('no space') || errStr.contains('enospc')) {
+        throw Exception(
+          'Not enough free storage space to load this model.',
+        );
+      }
+      if (errStr.contains('permission') || errStr.contains('eacces')) {
+        throw Exception(
+          'Permission denied reading "$filename". Try re-importing the file.',
+        );
       }
       rethrow;
     } finally {
@@ -231,117 +296,51 @@ class LlmService extends GetxService {
     _loadingCancelled = false;
   }
 
-  /// Tokens/patterns the model may emit that should be stripped from output.
-  /// Covers ChatML, Llama, Gemma, Phi, Mistral, and other common formats.
-  static final _stopPatterns = RegExp(
-    r'<\|end\|>'
-    r'|<\|eot_id\|>'
-    r'|<\|endoftext\|>'
-    r'|<\|im_end\|>'
-    r'|<\|im_start\|>'
-    r'|<end_of_turn>'
-    r'|<start_of_turn>'
-    r'|<\|assistant\|>'
-    r'|<\|user\|>'
-    r'|<\|system\|>'
-    r'|<\|pad\|>'
-    r'|</s>'
-    r'|<s>'
-    r'|\[INST\]'
-    r'|\[/INST\]'
-    r'|\[end\]',
-  );
-
-  /// Pattern that signals the model is hallucinating a new user turn — stop immediately.
-  static final _userTurnPattern = RegExp(
-    r'<\|user\|>|<\|im_start\|>\s*user|<start_of_turn>\s*user|\[INST\]',
-  );
-
-  /// Generate a streaming response.
-  /// [messages] is a list of {role, content} maps.
-  /// [systemPrompt] is prepended as a system message.
-  /// Returns a Stream of String tokens.
-  Stream<String> generate({
-    required List<Map<String, String>> messages,
-    String? systemPrompt,
-    double temperature = 0.7,
-  }) async* {
-    if (_engine == null || !isLoaded.value) {
-      throw StateError('No model loaded. Call loadModel() first.');
-    }
-    if (isGenerating.value) {
-      throw StateError('Another generation is already in progress.');
-    }
-
-    isGenerating.value = true;
-    tokensPerSecond.value = 0.0;
-    final stopwatch = Stopwatch()..start();
-    int tokenCount = 0;
-
-    // Buffer to detect multi-token stop sequences
-    String buffer = '';
-
+  /// Real context window size for the loaded model, straight from the
+  /// engine. Falls back to a conservative default if unavailable (no model
+  /// loaded yet, or the backend can't report it).
+  Future<int> getContextSize() async {
+    if (_engine == null || !isLoaded.value) return 2048;
     try {
-      // Build the full prompt from messages
-      final prompt = _buildPrompt(messages, systemPrompt);
-
-      await for (final token in _engine!.generate(prompt)) {
-        tokenCount++;
-        if (stopwatch.elapsedMilliseconds > 0) {
-          tokensPerSecond.value =
-              tokenCount / (stopwatch.elapsedMilliseconds / 1000);
-        }
-
-        // Accumulate into buffer for stop-pattern detection
-        buffer += token;
-
-        // Check if model is hallucinating a user turn — stop immediately
-        if (_userTurnPattern.hasMatch(buffer)) {
-          final cleaned = buffer
-              .replaceAll(_stopPatterns, '')
-              .replaceAll(_userTurnPattern, '')
-              .trim();
-          if (cleaned.isNotEmpty) {
-            yield cleaned;
-          }
-          break;
-        }
-
-        // Check if buffer contains any stop pattern
-        if (_stopPatterns.hasMatch(buffer)) {
-          // Yield everything before the stop pattern, then stop
-          final cleaned = buffer.replaceAll(_stopPatterns, '').trim();
-          if (cleaned.isNotEmpty) {
-            yield cleaned;
-          }
-          break;
-        }
-
-        // If buffer is getting long enough that we know it's safe, flush it
-        // Keep last 30 chars to detect split stop sequences
-        if (buffer.length > 40) {
-          final safe = buffer.substring(0, buffer.length - 30);
-          buffer = buffer.substring(buffer.length - 30);
-          yield safe;
-        }
-      }
-
-      // Flush any remaining buffer (cleaning all control patterns)
-      if (buffer.isNotEmpty) {
-        final cleaned = buffer
-            .replaceAll(_stopPatterns, '')
-            .replaceAll(_userTurnPattern, '')
-            .trim();
-        if (cleaned.isNotEmpty) {
-          yield cleaned;
-        }
-      }
-    } finally {
-      stopwatch.stop();
-      lastGenerationTokens.value = tokenCount;
-      lastGenerationSpeed.value = tokensPerSecond.value;
-      isGenerating.value = false;
+      return await _engine!.getContextSize();
+    } catch (_) {
+      return 2048;
     }
+  }
+
+  /// Sliding window over chat history: keeps a leading system message intact
+  /// and drops the oldest turns until the remainder plus [reserveForResponse]
+  /// tokens fits inside the model's real context window. Always keeps at
+  /// least the most recent turn, even if it alone doesn't fit, so a single
+  /// long message is still sent rather than silently dropped.
+  Future<List<LlamaChatMessage>> fitToContext(
+    List<LlamaChatMessage> messages, {
+    int reserveForResponse = 512,
+  }) async {
+    if (messages.isEmpty) return messages;
+
+    final ctx = await getContextSize();
+    final budget = ctx - reserveForResponse;
+    if (budget <= 0) return messages;
+
+    final hasSystem = messages.first.role == LlamaChatRole.system;
+    final systemMsg = hasSystem ? messages.first : null;
+    final turns = hasSystem ? messages.sublist(1) : messages;
+
+    var total = 0;
+    if (systemMsg != null) total += await countTokens(systemMsg.content);
+
+    // Walk newest-first, keeping whatever still fits the budget.
+    final keptReversed = <LlamaChatMessage>[];
+    for (final msg in turns.reversed) {
+      final t = await countTokens(msg.content);
+      if (total + t > budget && keptReversed.isNotEmpty) break;
+      total += t;
+      keptReversed.add(msg);
+    }
+
+    final kept = keptReversed.reversed.toList();
+    return systemMsg != null ? [systemMsg, ...kept] : kept;
   }
 
   /// Generate a chat completion using llamadart's chat-template API.
@@ -386,6 +385,45 @@ class LlmService extends GetxService {
     }
   }
 
+  /// Pair a CLIP vision projector (mmproj file) with the currently loaded
+  /// chat model, enabling image input for models that support it (e.g.
+  /// Gemma-3/4 with its matching `mmproj-*.gguf`). Must be called after
+  /// [loadModel] — the projector is loaded into the same engine/context.
+  Future<void> loadVisionProjector(String mmprojPath) async {
+    if (_engine == null || !isLoaded.value) {
+      throw StateError('Load a chat model before pairing a vision projector.');
+    }
+    LogService? log;
+    try { log = Get.find<LogService>(); } catch (_) {}
+    try {
+      await _engine!.loadMultimodalProjector(mmprojPath);
+      hasVisionProjector.value = true;
+      log?.info('Vision projector loaded: ${p.basename(mmprojPath)}', source: 'LLM');
+    } catch (e, stack) {
+      hasVisionProjector.value = false;
+      log?.error('Vision projector load failed: $e', source: 'LLM');
+      CrashLogService.instance.record(
+        'model_load',
+        'Vision projector load failed: $e',
+        stackTrace: stack.toString(),
+        context: 'mmproj=${p.basename(mmprojPath)}',
+      );
+      rethrow;
+    }
+  }
+
+  /// Removes the currently paired vision projector, if any.
+  Future<void> unloadVisionProjector() async {
+    if (_engine == null) return;
+    try {
+      await _engine!.unloadMultimodalProjector();
+    } catch (_) {
+      // Nothing to unload, or engine already torn down — either is fine.
+    } finally {
+      hasVisionProjector.value = false;
+    }
+  }
+
   Future<int> countTokens(String text) async {
     if (_engine == null || !isLoaded.value) return 0;
     try {
@@ -418,6 +456,7 @@ class LlmService extends GetxService {
     isLoaded.value = false;
     loadedModelPath.value = '';
     tokensPerSecond.value = 0.0;
+    hasVisionProjector.value = false;
   }
 
   /// Unload the current model and free memory.
@@ -431,29 +470,18 @@ class LlmService extends GetxService {
     } catch (_) {}
   }
 
-  /// Build a single prompt string from chat messages.
-  String _buildPrompt(
-    List<Map<String, String>> messages,
-    String? systemPrompt,
-  ) {
-    final buffer = StringBuffer();
-
-    if (systemPrompt != null && systemPrompt.isNotEmpty) {
-      buffer.writeln('<|system|>');
-      buffer.writeln(systemPrompt);
-      buffer.writeln('<|end|>');
+  String _kindLabel(ModelKind kind) {
+    switch (kind) {
+      case ModelKind.visionProjector:
+        return 'vision projector';
+      case ModelKind.embedding:
+        return 'embedding model';
+      case ModelKind.loraAdapter:
+        return 'LoRA adapter';
+      case ModelKind.chat:
+      case ModelKind.unknown:
+        return 'file';
     }
-
-    for (final msg in messages) {
-      final role = msg['role'] ?? 'user';
-      final content = msg['content'] ?? '';
-      buffer.writeln('<|$role|>');
-      buffer.writeln(content);
-      buffer.writeln('<|end|>');
-    }
-
-    buffer.writeln('<|assistant|>');
-    return buffer.toString();
   }
 
   @override

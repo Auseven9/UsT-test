@@ -5,6 +5,7 @@ import 'package:flutter_animate/flutter_animate.dart';
 import '../theme/app_colors.dart';
 import '../controllers/model_controller.dart';
 import '../services/model_manager.dart';
+import '../services/gguf_inspector.dart';
 import '../models/ai_model_info.dart';
 import '../widgets/model_card.dart';
 
@@ -275,42 +276,156 @@ class _ModelLibraryBodyState extends State<_ModelLibraryBody> {
     ModelController ctrl,
     String filename,
   ) {
+    final kind = ctrl.kindOf(filename);
+
+    switch (kind) {
+      case ModelKind.visionProjector:
+        return _specialFileCard(
+          context,
+          filename: filename,
+          icon: Icons.image_search_rounded,
+          iconColor: AppColors.accentHi,
+          subtitle: 'Vision projector — pairs with your loaded chat model '
+              'to add image understanding. Not a standalone model.',
+          actionLabel: 'Pair with Loaded Model',
+          onAction: () => ctrl.pairVisionProjector(filename),
+        );
+      case ModelKind.embedding:
+        final isActive = ctrl.isMemoryModelLoaded &&
+            ctrl.loadedMemoryModelFilename == filename;
+        return _specialFileCard(
+          context,
+          filename: filename,
+          icon: Icons.search_rounded,
+          iconColor: AppColors.standard,
+          subtitle: 'Embedding model — powers persistent memory search, '
+              'not chat generation.',
+          actionLabel: isActive ? 'Active Memory Model' : 'Set as Memory Model',
+          onAction: isActive ? null : () => ctrl.setMemoryModel(filename),
+        );
+      case ModelKind.loraAdapter:
+        return _specialFileCard(
+          context,
+          filename: filename,
+          icon: Icons.tune_rounded,
+          iconColor: AppColors.orange,
+          subtitle: 'LoRA adapter — modifies a base model rather than '
+              'running standalone. Not yet supported by this app.',
+          actionLabel: null,
+          onAction: null,
+        );
+      case ModelKind.chat:
+      case ModelKind.unknown:
+        return Container(
+          margin: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: context.bgPanel,
+            border: Border.all(color: context.border),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Row(
+            children: [
+              Icon(Icons.description_outlined, size: 18, color: context.textM),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  filename,
+                  style: TextStyle(fontSize: 13, color: context.text),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 8),
+              ElevatedButton(
+                onPressed: () => ctrl.loadModel(filename),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.green,
+                  foregroundColor: Colors.white,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  elevation: 0,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+                child: const Text(
+                  'Load',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+        );
+    }
+  }
+
+  /// Card for a non-chat `.gguf` file (vision projector, embedding model,
+  /// LoRA adapter) — same visual language as the normal file card, but with
+  /// an explanation instead of a plain "Load" button, since loading these
+  /// through the regular chat flow doesn't make sense.
+  Widget _specialFileCard(
+    BuildContext context, {
+    required String filename,
+    required IconData icon,
+    required Color iconColor,
+    required String subtitle,
+    required String? actionLabel,
+    required VoidCallback? onAction,
+  }) {
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: context.bgPanel,
-        border: Border.all(color: context.border),
+        border: Border.all(color: iconColor.withOpacity(0.3)),
         borderRadius: BorderRadius.circular(12),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(Icons.description_outlined, size: 18, color: context.textM),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              filename,
-              style: TextStyle(fontSize: 13, color: context.text),
-              overflow: TextOverflow.ellipsis,
-            ),
+          Row(
+            children: [
+              Icon(icon, size: 18, color: iconColor),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  filename,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: context.text,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
           ),
-          const SizedBox(width: 8),
-          ElevatedButton(
-            onPressed: () => ctrl.loadModel(filename),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.green,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              elevation: 0,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
+          const SizedBox(height: 6),
+          Text(
+            subtitle,
+            style: TextStyle(fontSize: 12, color: context.textM, height: 1.4),
+          ),
+          if (actionLabel != null) ...[
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton(
+                onPressed: onAction,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: iconColor,
+                  side: BorderSide(color: iconColor.withOpacity(0.5)),
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+                child: Text(
+                  actionLabel,
+                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                ),
               ),
             ),
-            child: const Text(
-              'Load',
-              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-            ),
-          ),
+          ],
         ],
       ),
     );

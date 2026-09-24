@@ -6,6 +6,10 @@ import '../services/chat_storage_service.dart';
 import '../services/local_api_server_service.dart';
 import '../services/wakelock_service.dart';
 import '../services/log_service.dart';
+import '../services/embedding_service.dart';
+import '../services/memory_service.dart';
+import '../services/crash_log_service.dart';
+import '../services/resource_monitor_service.dart';
 import '../controllers/chat_controller.dart';
 import '../controllers/model_controller.dart';
 import '../controllers/theme_controller.dart';
@@ -21,6 +25,12 @@ class AppBindings extends Bindings {
     Get.lazyPut(() => LocalApiServerService(), fenix: true);
     Get.lazyPut(() => WakelockService(), fenix: true);
     Get.lazyPut(() => LogService(), fenix: true);
+    Get.lazyPut(() => EmbeddingService(), fenix: true);
+    Get.lazyPut(() => MemoryService(), fenix: true);
+    // Already constructed and recording in main() before bindings run —
+    // register that exact instance rather than a fresh one.
+    Get.put(CrashLogService.instance, permanent: true);
+    Get.lazyPut(() => ResourceMonitorService(), fenix: true);
 
     // ── Controllers ──────────────────────────────────────────────
     Get.put(

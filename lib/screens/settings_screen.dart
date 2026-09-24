@@ -10,6 +10,10 @@ import '../services/local_api_server_service.dart';
 import '../services/model_manager.dart';
 import '../services/background_optimizer_service.dart';
 import '../services/chat_storage_service.dart';
+import '../services/embedding_service.dart';
+import '../services/memory_service.dart';
+import '../services/crash_log_service.dart';
+import '../routes/app_routes.dart';
 
 class SettingsScreen extends StatelessWidget {
   /// When true, no Scaffold — just the body content for embedding in tabs.
@@ -41,6 +45,8 @@ class _SettingsBody extends StatelessWidget {
     final themeCtrl = Get.find<ThemeController>();
     final apiServer = Get.find<LocalApiServerService>();
     final storage = Get.find<ChatStorageService>();
+    final memory = Get.find<MemoryService>();
+    final embedding = Get.find<EmbeddingService>();
 
     return Column(
       children: [
@@ -281,6 +287,20 @@ class _SettingsBody extends StatelessWidget {
               _sectionHeader(context, 'Hardware Configuration'),
               const SizedBox(height: 8),
               _HardwareSettingsCard(storage: storage),
+
+              const SizedBox(height: 28),
+
+              // ── Persistent Memory ──────────────────────────
+              _sectionHeader(context, 'Persistent Memory'),
+              const SizedBox(height: 8),
+              Text(
+                'Distills conversations into short notes that can surface again '
+                'in any future chat. Needs an embedding model (set one from a '
+                'downloaded embedding-kind file in the Models tab).',
+                style: TextStyle(fontSize: 12, color: context.textD),
+              ),
+              const SizedBox(height: 12),
+              _PersistentMemoryCard(storage: storage, memory: memory, embedding: embedding),
 
               const SizedBox(height: 28),
 
@@ -705,6 +725,74 @@ class _SettingsBody extends StatelessWidget {
                   onTap: () => Get.toNamed('/logs'),
                 ),
               ),
+              const SizedBox(height: 8),
+              _card(
+                context,
+                child: Obx(() {
+                  final crashLog = Get.find<CrashLogService>();
+                  final count = crashLog.entries.length;
+                  return ListTile(
+                    leading: Container(
+                      width: 36,
+                      height: 36,
+                      decoration: BoxDecoration(
+                        color: AppColors.red.withValues(alpha: 0.12),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(Icons.bug_report_outlined,
+                          size: 18, color: AppColors.red),
+                    ),
+                    title: Text(
+                      'Crash Log',
+                      style: TextStyle(color: context.text, fontSize: 14),
+                    ),
+                    subtitle: Text(
+                      count == 0
+                          ? 'No crashes recorded'
+                          : '$count entr${count == 1 ? 'y' : 'ies'} — survives app restarts',
+                      style: TextStyle(color: context.textD, fontSize: 12),
+                    ),
+                    trailing: Icon(Icons.arrow_forward_ios_rounded,
+                        size: 14, color: context.textD),
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 4,
+                    ),
+                    onTap: () => Get.toNamed(AppRoutes.crashLog),
+                  );
+                }),
+              ),
+              const SizedBox(height: 8),
+              _card(
+                context,
+                child: ListTile(
+                  leading: Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: AppColors.accent.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Icon(Icons.speed_rounded,
+                        size: 18, color: AppColors.accent),
+                  ),
+                  title: Text(
+                    'Resource Monitor',
+                    style: TextStyle(color: context.text, fontSize: 14),
+                  ),
+                  subtitle: Text(
+                    'Live CPU, memory, and generation-speed graphs',
+                    style: TextStyle(color: context.textD, fontSize: 12),
+                  ),
+                  trailing: Icon(Icons.arrow_forward_ios_rounded,
+                      size: 14, color: context.textD),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 4,
+                  ),
+                  onTap: () => Get.toNamed(AppRoutes.resourceMonitor),
+                ),
+              ),
 
               const SizedBox(height: 32),
             ],
@@ -753,6 +841,118 @@ class _SettingsBody extends StatelessWidget {
           fontWeight: FontWeight.w600,
         ),
       ),
+    );
+  }
+}
+
+class _PersistentMemoryCard extends StatefulWidget {
+  final ChatStorageService storage;
+  final MemoryService memory;
+  final EmbeddingService embedding;
+
+  const _PersistentMemoryCard({
+    required this.storage,
+    required this.memory,
+    required this.embedding,
+  });
+
+  @override
+  State<_PersistentMemoryCard> createState() => _PersistentMemoryCardState();
+}
+
+class _PersistentMemoryCardState extends State<_PersistentMemoryCard> {
+  late bool _enabled;
+
+  @override
+  void initState() {
+    super.initState();
+    _enabled = widget.storage.persistentMemoryEnabled;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _cardDecoration(
+      context,
+      child: Obx(() {
+        final hasEmbeddingModel = widget.embedding.isLoaded.value;
+        return Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SwitchListTile(
+                title: Text(
+                  'Persistent memory',
+                  style: TextStyle(color: context.text, fontSize: 14),
+                ),
+                subtitle: Text(
+                  hasEmbeddingModel
+                      ? 'Embedding model: ${widget.embedding.loadedModelFilename}'
+                      : 'Set an embedding model in the Models tab first',
+                  style: TextStyle(color: context.textD, fontSize: 12),
+                ),
+                secondary: Icon(
+                  Icons.psychology_alt_rounded,
+                  color: _enabled ? AppColors.accent : context.textM,
+                ),
+                value: _enabled,
+                onChanged: !hasEmbeddingModel
+                    ? null
+                    : (value) {
+                        setState(() => _enabled = value);
+                        widget.storage.persistentMemoryEnabled = value;
+                      },
+                activeThumbColor: AppColors.accent,
+                contentPadding: EdgeInsets.zero,
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Icon(Icons.folder_outlined, size: 14, color: context.textD),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      widget.memory.memoryDirPath,
+                      style: TextStyle(fontSize: 11, color: context.textD),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () => Get.toNamed(AppRoutes.memory),
+                  icon: const Icon(Icons.list_alt_rounded, size: 18),
+                  label: Obx(
+                    () => Text('View Memories (${widget.memory.entries.length})'),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: context.text,
+                    side: BorderSide(color: context.border),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      }),
+    );
+  }
+
+  Widget _cardDecoration(BuildContext context, {required Widget child}) {
+    return Container(
+      decoration: BoxDecoration(
+        color: context.bgPanel,
+        border: Border.all(color: context.border),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: child,
     );
   }
 }

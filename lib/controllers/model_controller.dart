@@ -9,12 +9,15 @@ import '../models/download_state.dart';
 import '../services/model_manager.dart';
 import '../services/llm_service.dart';
 import '../services/chat_storage_service.dart';
+import '../services/embedding_service.dart';
+import '../services/gguf_inspector.dart';
 import '../services/log_service.dart';
 
 class ModelController extends GetxController {
   final ModelManager _manager = Get.find<ModelManager>();
   final LlmService _llm = Get.find<LlmService>();
   final ChatStorageService _storage = Get.find<ChatStorageService>();
+  final EmbeddingService _embedding = Get.find<EmbeddingService>();
 
   // ── Observable State ──────────────────────────────────────────
   final selectedModelFilename = RxnString();
@@ -29,6 +32,15 @@ class ModelController extends GetxController {
   List<String> get downloadedModels => _manager.downloadedModels;
   bool get isModelLoaded => _llm.isLoaded.value;
   double get tokensPerSecond => _llm.tokensPerSecond.value;
+
+  /// What a downloaded file actually is — chat model, vision projector,
+  /// embedding model, or LoRA adapter. Only [ModelKind.chat] files should be
+  /// offered through the normal "Load Model" flow.
+  ModelKind kindOf(String filename) => _manager.kindOf(filename);
+
+  bool get hasVisionProjector => _llm.hasVisionProjector.value;
+  bool get isMemoryModelLoaded => _embedding.isLoaded.value;
+  String get loadedMemoryModelFilename => _embedding.loadedModelFilename;
 
   @override
   void onInit() {
@@ -318,6 +330,15 @@ class ModelController extends GetxController {
         final exists = _manager.catalog.any((m) => m.filename == name);
         
         if (!exists) {
+          // Classify what was actually imported — the file is already on
+          // disk at this point, so this doesn't have to default to "chat"
+          // and hope a later scan corrects it (it wouldn't: scanDownloaded
+          // skips anything already in the catalog).
+          final kind = (await GgufInspector.inspect(
+            _manager.getModelPathByFilename(name),
+          ))
+              .kind;
+
           // Add to catalog so it shows up in the UI
           final customModel = AiModelInfo(
             id: 'custom_${DateTime.now().millisecondsSinceEpoch}',
@@ -329,6 +350,7 @@ class ModelController extends GetxController {
             label: 'CUSTOM',
             badge: 'LOCAL',
             systemPrompt: 'You are a helpful AI assistant.',
+            kind: kind,
           );
           _manager.addCustomModel(customModel);
         }
@@ -405,6 +427,14 @@ class ModelController extends GetxController {
         final exists = _manager.catalog.any((m) => m.filename == fileName);
 
         if (!exists) {
+          // Classify each file individually — a folder import is exactly
+          // the case where chat models, mmproj files, and embedding models
+          // are likely to be mixed together in one pass.
+          final kind = (await GgufInspector.inspect(
+            _manager.getModelPathByFilename(fileName),
+          ))
+              .kind;
+
           // Add to catalog so it shows up in the UI
           final customModel = AiModelInfo(
             id: 'custom_${DateTime.now().millisecondsSinceEpoch}_$i',
@@ -416,6 +446,7 @@ class ModelController extends GetxController {
             label: 'CUSTOM',
             badge: 'LOCAL',
             systemPrompt: 'You are a helpful AI assistant.',
+            kind: kind,
           );
           _manager.addCustomModel(customModel);
         }
@@ -445,6 +476,59 @@ class ModelController extends GetxController {
   /// Check if a model is downloaded.
   bool isModelDownloaded(AiModelInfo model) {
     return _manager.isModelDownloaded(model);
+  }
+
+  /// Pairs a vision-projector (mmproj) file with the currently loaded chat
+  /// model, enabling image input. Requires a chat model to already be
+  /// loaded — the projector attaches to that model's context.
+  Future<void> pairVisionProjector(String mmprojFilename) async {
+    if (!_llm.isLoaded.value) {
+      Get.snackbar(
+        'No Model Loaded',
+        'Load a chat model first, then pair this vision projector with it.',
+        snackPosition: SnackPosition.BOTTOM,
+      );
+      return;
+    }
+    try {
+      final path = _manager.getModelPathByFilename(mmprojFilename);
+      await _llm.loadVisionProjector(path);
+      // Honest scope: this pairs the projector at the engine level only.
+      // There is no image-attach control in the chat composer yet, so
+      // don't claim image chat itself is ready to use.
+      Get.snackbar(
+        'Vision Projector Paired',
+        'Enabled at the engine level. Image attachment in chat isn\'t built yet.',
+        snackPosition: SnackPosition.BOTTOM,
+        duration: const Duration(seconds: 4),
+      );
+    } catch (e) {
+      Get.snackbar(
+        'Pairing Failed',
+        e.toString(),
+        snackPosition: SnackPosition.BOTTOM,
+      );
+    }
+  }
+
+  /// Loads an embedding-kind file as the active memory-retrieval model.
+  Future<void> setMemoryModel(String filename) async {
+    try {
+      final path = _manager.getModelPathByFilename(filename);
+      await _embedding.loadModel(path);
+      _storage.memoryEmbeddingModelFilename = filename;
+      Get.snackbar(
+        'Memory Model Set',
+        '$filename will be used for persistent memory retrieval.',
+        snackPosition: SnackPosition.BOTTOM,
+      );
+    } catch (e) {
+      Get.snackbar(
+        'Load Failed',
+        e.toString(),
+        snackPosition: SnackPosition.BOTTOM,
+      );
+    }
   }
 
   /// Get info for a specific filename.

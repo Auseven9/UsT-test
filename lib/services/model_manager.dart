@@ -10,13 +10,21 @@ import 'package:path/path.dart' as p;
 
 import '../models/ai_model_info.dart';
 import '../models/download_state.dart';
+import 'gguf_inspector.dart';
 import 'wakelock_service.dart';
 
 /// Manages model catalog, downloads, and local file discovery.
 class ModelManager extends GetxService {
   final catalog = <AiModelInfo>[].obs;
   final downloadedModels = <String>[].obs; // filenames on-disk (list for reactivity)
-  
+
+  /// What kind each *locally discovered* file actually is (chat model,
+  /// vision projector, embedding model, LoRA adapter) — filled in by
+  /// [GgufInspector] the first time a file is seen, then cached so we never
+  /// re-parse a file's header on every scan.
+  final localFileKinds = <String, ModelKind>{}.obs;
+  static const _fileKindsKey = 'local_file_kinds';
+
   // ── Download tracking (single reactive object) ─────────────
   final activeDownloads = <String, DownloadState>{}.obs;
   final tick = 0.obs; // force UI refresh counter
@@ -26,9 +34,60 @@ class ModelManager extends GetxService {
 
   Future<ModelManager> init() async {
     _modelsDir = await _getModelsDir();
+    _loadFileKindsCache();
     await _loadCatalog();
     await scanDownloaded();
     return this;
+  }
+
+  void _loadFileKindsCache() {
+    try {
+      final box = Hive.box('models_meta');
+      final raw = box.get(_fileKindsKey, defaultValue: <dynamic, dynamic>{});
+      final map = Map<String, dynamic>.from(raw as Map);
+      for (final entry in map.entries) {
+        final kind = ModelKind.values.firstWhere(
+          (k) => k.name == entry.value,
+          orElse: () => ModelKind.chat,
+        );
+        localFileKinds[entry.key] = kind;
+      }
+    } catch (_) {
+      // Corrupt/missing cache — will simply be rebuilt on next scan.
+    }
+  }
+
+  void _persistFileKindsCache() {
+    try {
+      final box = Hive.box('models_meta');
+      box.put(
+        _fileKindsKey,
+        localFileKinds.map((filename, kind) => MapEntry(filename, kind.name)),
+      );
+    } catch (_) {}
+  }
+
+  /// What kind a file actually is — catalog/custom entries carry their own
+  /// [AiModelInfo.kind] (always [ModelKind.chat] today); anything else falls
+  /// back to the locally-classified cache, defaulting to chat if unknown.
+  ModelKind kindOf(String filename) {
+    for (final m in catalog) {
+      if (m.filename == filename) return m.kind;
+    }
+    return localFileKinds[filename] ?? ModelKind.chat;
+  }
+
+  /// Re-inspects an on-disk file and updates its catalog entry's [kind] in
+  /// place, if it has one. Used wherever a catalog entry is created before
+  /// its file exists (URL-added custom models) or where a file needs to be
+  /// classified as it's added, rather than left at the default.
+  Future<void> _reclassifyCatalogEntry(String filename) async {
+    final index = catalog.indexWhere((m) => m.filename == filename);
+    if (index == -1) return;
+    final meta = await GgufInspector.inspect(p.join(_modelsDir, filename));
+    if (meta.kind == catalog[index].kind) return;
+    catalog[index] = catalog[index].copyWith(kind: meta.kind);
+    if (catalog[index].isCustom) _persistCustomModels();
   }
 
   /// Resolve models directory.
@@ -85,7 +144,9 @@ class ModelManager extends GetxService {
     } catch (_) {}
   }
 
-  /// Scan the models directory for downloaded .gguf files.
+  /// Scan the models directory for downloaded .gguf files, classifying any
+  /// newly-seen file (chat model / vision projector / embedding / adapter)
+  /// so the library can stop treating every `.gguf` as a loadable chat model.
   Future<void> scanDownloaded() async {
     final dir = Directory(_modelsDir);
     if (!await dir.exists()) return;
@@ -97,6 +158,21 @@ class ModelManager extends GetxService {
         .toList();
 
     downloadedModels.value = files;
+
+    // Classify any file we haven't seen before. Catalog/custom entries
+    // already carry their own kind, so skip those — this is purely for
+    // files that just appear on disk (side-loaded, imported, or dropped in
+    // directly) with no catalog entry at all.
+    final isCatalogFile = {for (final m in catalog) m.filename};
+    var changed = false;
+    for (final filename in files) {
+      if (isCatalogFile.contains(filename)) continue;
+      if (localFileKinds.containsKey(filename)) continue;
+      final meta = await GgufInspector.inspect(p.join(_modelsDir, filename));
+      localFileKinds[filename] = meta.kind;
+      changed = true;
+    }
+    if (changed) _persistFileKindsCache();
   }
 
   String getModelPath(AiModelInfo model) => p.join(_modelsDir, model.filename);
@@ -205,6 +281,13 @@ class ModelManager extends GetxService {
         if (!downloadedModels.contains(model.filename)) {
           downloadedModels.add(model.filename);
         }
+        // Custom/URL-added catalog entries default to ModelKind.chat at
+        // creation time, before the file even exists to inspect. Now that
+        // it's actually on disk, classify it for real — otherwise a
+        // vision-projector or embedding model added by URL would stay
+        // mislabeled forever (scanDownloaded() deliberately skips files
+        // already in the catalog, so nothing else would ever correct this).
+        await _reclassifyCatalogEntry(model.filename);
       }
 
       state.isActive = false;

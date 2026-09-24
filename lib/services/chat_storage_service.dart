@@ -107,4 +107,21 @@ class ChatStorageService extends GetxService {
       _settingsBox.get('backend_type', defaultValue: 'cpu') as String;
 
   set backendType(String value) => _settingsBox.put('backend_type', value);
+
+  // ── Persistent Memory ───────────────────────────────────────
+
+  bool get persistentMemoryEnabled =>
+      _settingsBox.get('persistent_memory_enabled', defaultValue: false)
+          as bool;
+
+  set persistentMemoryEnabled(bool value) =>
+      _settingsBox.put('persistent_memory_enabled', value);
+
+  /// Filename (within the models directory) of the embedding model used for
+  /// memory retrieval — empty string means none selected yet.
+  String get memoryEmbeddingModelFilename =>
+      _settingsBox.get('memory_embedding_model', defaultValue: '') as String;
+
+  set memoryEmbeddingModelFilename(String value) =>
+      _settingsBox.put('memory_embedding_model', value);
 }
