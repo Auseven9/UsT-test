@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
+import 'package:flutter/widgets.dart' show EdgeInsets;
 import 'package:get/get.dart';
 import 'package:llamadart/llamadart.dart';
 
@@ -14,6 +16,7 @@ import '../services/helper_llm_service.dart';
 import '../services/memory_service.dart';
 import '../services/memory_heuristics.dart';
 import '../services/tool_definitions.dart';
+import '../services/log_service.dart';
 
 /// Hard safety cap on a single response, independent of context size —
 /// bounds worst-case generation time/battery drain if a model never
@@ -52,6 +55,44 @@ class ChatController extends GetxController {
         includeMemorySearch: _storage.persistentMemoryEnabled,
       );
 
+  LogService? get _log {
+    try {
+      return Get.find<LogService>();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// One short, always-current paragraph telling the model what it actually
+  /// is and can do here — built from the real tool list rather than a
+  /// hand-written description, so it can never drift out of sync with what
+  /// tool_definitions.dart actually exposes. Without this, a model has no way
+  /// to know it's running fully offline on a phone (not a hosted API), or
+  /// which of its "I can't do X" instincts (inherited from training on a
+  /// hosted assistant) are simply wrong here — e.g. claiming it has no way
+  /// to know the date when get_current_datetime is one tool call away, or
+  /// narrating a fake "saving to memory" action instead of trusting the real
+  /// automatic capture described separately below.
+  /// [tools] must be the exact same list actually passed to generation this
+  /// turn (or null when Tools is off) — otherwise a user who has turned
+  /// Tools off would still be told about tools that no schema was ever sent
+  /// for, and the model either hallucinates a call that goes nowhere or
+  /// claims a capability it doesn't have here.
+  String _buildAppContextBlock(List<ToolDefinition>? tools) {
+    final withOs = 'You are running as the on-device assistant inside '
+        '"Uncensored Local AI" — a modified, uncensored local-inference '
+        'app. There is no server: every reply is generated fully offline by '
+        'a local model file on the user\'s own ${Platform.operatingSystem} '
+        'device, and nothing leaves the device. You are not the only model '
+        'in the app — a separate small embedding model handles memory '
+        'search behind the scenes, and a separate small helper model may '
+        'distill memories in the background; neither is something you call '
+        'directly.';
+    if (tools == null || tools.isEmpty) return withOs;
+    final toolLines = tools.map((t) => '- ${t.name}: ${t.description}').join('\n');
+    return '$withOs\nThe tools you can actually call in this conversation:\n$toolLines';
+  }
+
   final chats = <ChatModel>[].obs;
   final activeChatId = RxnString();
   final isGenerating = false.obs;
@@ -61,6 +102,7 @@ class ChatController extends GetxController {
   final systemPrompt = ''.obs;
 
   StreamSubscription<String>? _genSub;
+  Timer? _memorySweepTimer;
 
   @override
   void onInit() {
@@ -68,7 +110,69 @@ class ChatController extends GetxController {
     _loadChats();
     temperature.value = _storage.defaultTemperature;
     systemPrompt.value = _storage.globalSystemPrompt;
+    _scheduleMemorySweep();
   }
+
+  /// (Re)schedules the periodic memory-health sweep from the current
+  /// tunable interval in Settings — call again after the user changes that
+  /// setting so a new interval takes effect without an app restart.
+  void _scheduleMemorySweep() {
+    _memorySweepTimer?.cancel();
+    final minutes = _storage.memorySweepIntervalMinutes;
+    if (minutes <= 0) return;
+    _memorySweepTimer =
+        Timer.periodic(Duration(minutes: minutes), (_) => _runMemorySweep());
+  }
+
+  /// Public so Settings can call it right after the user changes the sweep
+  /// interval, instead of the new value only taking effect on next launch.
+  void rescheduleMemorySweep() => _scheduleMemorySweep();
+
+  /// Periodic "is everything actually working" check — verifies each model
+  /// the app is configured to use is genuinely loaded (armed), and flushes
+  /// any pending debounced memory write to disk. Cheap: it only reads
+  /// in-memory flags and does a file write, no model inference, so a short
+  /// interval doesn't cost battery the way an actual probe generation would.
+  Future<void> _runMemorySweep() async {
+    _log?.info('Memory sweep starting...', source: 'Memory');
+    final problems = <String>[];
+    if (!_llm.isLoaded.value) problems.add('main model not armed');
+    if (_storage.persistentMemoryEnabled) {
+      if (!_embedding.isLoaded.value) problems.add('embedding model not armed');
+      if (_storage.helperModelFilename.isNotEmpty && !_helper.isLoaded.value) {
+        problems.add('helper model not armed (falling back to main model)');
+      }
+    }
+    await _memory.flushPending();
+    if (problems.isEmpty) {
+      _log?.info(
+        'Memory sweep OK — all configured models armed, '
+        '${_memory.entries.length} memories on disk.',
+        source: 'Memory',
+      );
+    } else {
+      final msg = 'Memory sweep found issues: ${problems.join(', ')}.';
+      _log?.warn(msg, source: 'Memory');
+      _toast(msg);
+    }
+  }
+
+  /// Best-effort toast — swallows the error if no overlay is currently
+  /// mounted (e.g. app just backgrounded) since the matching log line above
+  /// every call site already captured the same information durably.
+  void _toast(String message) {
+    try {
+      Get.snackbar(
+        'Memory',
+        message,
+        snackPosition: SnackPosition.BOTTOM,
+        duration: const Duration(seconds: 3),
+        margin: const EdgeInsets.all(12),
+      );
+    } catch (_) {}
+  }
+
+  String _truncateForToast(String s) => s.length > 60 ? '${s.substring(0, 60)}…' : s;
 
   void _loadChats() {
     chats.value = _storage.getAllChats();
@@ -145,12 +249,23 @@ class ChatController extends GetxController {
     _storage.saveChat(chat);
     chats.refresh();
 
+    // Computed once and reused both for the system prompt's tool listing
+    // below and for what's actually handed to generation further down —
+    // `_tools` rebuilds the whole ToolDefinition list (with closures) on
+    // every access, so calling it twice per message would do that work
+    // twice for no reason.
+    final activeTools = _storage.toolsEnabled ? _tools : null;
+
     // Build message history as real chat messages — the effective system
     // prompt (per-chat override, else global) goes first so the model's own
     // Jinja chat template (read from the GGUF's tokenizer.chat_template) can
     // render it correctly for whatever family is loaded (Gemma, Qwen, Phi, …).
     var effectiveSystemPrompt =
         chat.systemPrompt.isNotEmpty ? chat.systemPrompt : systemPrompt.value;
+    final appContextBlock = _buildAppContextBlock(activeTools);
+    effectiveSystemPrompt = effectiveSystemPrompt.isEmpty
+        ? appContextBlock
+        : '$appContextBlock\n\n$effectiveSystemPrompt';
 
     // Persistent memory retrieval — heuristic-gated so it costs nothing on
     // the common case. A cheap regex pass decides whether the message is
@@ -266,7 +381,6 @@ class ChatController extends GetxController {
     chat.messages.add(aiMsg);
     chats.refresh();
 
-    final activeTools = _storage.toolsEnabled ? _tools : null;
     var roundMessages = fitResult.messages;
     // Actual usable response budget for this turn — starts at whatever
     // fitToContext determined fit alongside the trimmed history, and gets
@@ -434,21 +548,38 @@ class ChatController extends GetxController {
       chats.refresh();
     }
 
-    // `looksMemorable` (a regex pass — first-person identity/preference
-    // statements, explicit "remember this", etc.) decides WHETHER a turn is
-    // worth capturing at all, so most turns (small talk, one-off questions)
-    // never touch the chat model. But storing the raw *trigger* text
-    // verbatim was wrong: "remember that." said right after the model
-    // explained its own persona would get stored as literally the three
-    // words "remember that." — the thing worth remembering was the
-    // preceding content, not the command pointing at it. So once the gate
-    // fires, a short bounded extraction call (not run on every turn — only
-    // on turns the heuristic already flagged) reads the actual exchange and
-    // distills what's durable, the same judgment call a human would need to
-    // make when "that" doesn't name itself.
+    // Extraction runs after every non-trivial exchange (both the user's
+    // message and the model's reply are handed to it together) — only a
+    // `looksTrivial` filter (single-word acknowledgements, greetings) skips
+    // it, to avoid burning a background generation on "ok"/"thanks"/"hi"
+    // with nothing durable in them. This used to be gated much tighter, on
+    // `looksMemorable` (explicit "remember this", first-person identity
+    // statements, etc.) — cheaper, but it meant most exchanges were never
+    // even considered for memory, which missed real, non-trigger-worded
+    // facts the model volunteered mid-conversation. Storing the raw
+    // *trigger* text verbatim was also wrong on its own terms: "remember
+    // that." said right after the model explained its persona would get
+    // stored as literally the three words "remember that." — the thing
+    // worth remembering was the preceding content, not the command pointing
+    // at it. So a short bounded extraction call reads the actual exchange
+    // and distills what's durable, the same judgment call a human would
+    // need to make when "that" doesn't name itself.
+    //
+    // The broad `!looksTrivial` gate is only safe with a dedicated helper
+    // model loaded — it runs in its own engine, so it can't contend with the
+    // main model's single generation slot. Without one, extraction falls
+    // back to running ON the main model (see below), and firing that on
+    // nearly every turn would mean the *next* message routinely waits out a
+    // background generation before its own reply can even start — so
+    // without a helper, stay on the tighter, trigger-worded `looksMemorable`
+    // gate instead.
+    final canExtractEveryTurn = _helper.isLoaded.value;
+    final worthExtracting = canExtractEveryTurn
+        ? !MemoryHeuristics.looksTrivial(trimmedText)
+        : MemoryHeuristics.looksMemorable(trimmedText);
     if (_storage.persistentMemoryEnabled &&
         _embedding.isLoaded.value &&
-        MemoryHeuristics.looksMemorable(trimmedText)) {
+        worthExtracting) {
       unawaited(_extractAndRememberFromTurn(
         userMsg,
         aiMsg,
@@ -519,20 +650,21 @@ class ChatController extends GetxController {
     return toolCalls;
   }
 
-  /// Looks at the latest user+assistant exchange — already flagged by
-  /// [MemoryHeuristics.looksMemorable] as worth capturing — and asks the
-  /// model to distill anything durable, tagged with category/valence/tags,
-  /// so something like "remember that" (which names nothing on its own)
-  /// correctly captures whatever it was pointing at instead of being stored
-  /// as its own three words. Also given [relevantMemories] — the same
-  /// memories already retrieved for this turn's system prompt, at no extra
-  /// retrieval cost — so it can flag when the new fact contradicts one of
-  /// them (an updated fact), in which case the old one is marked superseded
-  /// rather than left to compete equally with the current one. Bounded and
-  /// cheap (short output, low temp), and only ever runs on a turn the
-  /// heuristic gate already flagged — not every turn. Best-effort
-  /// throughout; any failure here is silent since it must never surface as
-  /// a chat error, and a small model producing malformed output degrades to
+  /// Looks at the latest user+assistant exchange — already flagged as worth
+  /// capturing by the gate in [sendMessage] (every non-trivial turn when a
+  /// helper model is armed, or just [MemoryHeuristics.looksMemorable] turns
+  /// otherwise) — and asks the model to distill anything durable, tagged
+  /// with category/valence/tags, so something like "remember that" (which
+  /// names nothing on its own) correctly captures whatever it was pointing
+  /// at instead of being stored as its own three words. Also given
+  /// [relevantMemories] — the same memories already retrieved for this
+  /// turn's system prompt, at no extra retrieval cost — so it can flag when
+  /// the new fact contradicts one of them (an updated fact), in which case
+  /// the old one is marked superseded rather than left to compete equally
+  /// with the current one. Bounded and cheap (short output, low temp).
+  /// Best-effort throughout; any failure here is silent since it must never
+  /// surface as a chat error, and a small model producing malformed output
+  /// degrades to
   /// the plain-text behavior this replaced rather than losing the memory.
   Future<void> _extractAndRememberFromTurn(
     MessageModel userMsg,
@@ -542,7 +674,19 @@ class ChatController extends GetxController {
   ) async {
     try {
       final useHelper = _helper.isLoaded.value;
-      if (!useHelper && !_llm.isLoaded.value) return;
+      if (!useHelper && !_llm.isLoaded.value) {
+        _log?.warn(
+          'Memory extraction skipped: no helper model loaded and no main '
+          'model loaded either.',
+          source: 'Memory',
+        );
+        return;
+      }
+      _log?.info(
+        'Memory extraction triggered (using ${useHelper ? 'helper' : 'main'} '
+        'model).',
+        source: 'Memory',
+      );
 
       // A bit more room than a one-sentence extraction needed, to fit the
       // small JSON structure (text/category/valence/tags) below.
@@ -687,7 +831,11 @@ class ChatController extends GetxController {
         }
       }
 
-      if (extracted == null) return;
+      if (extracted == null) {
+        _log?.warn('Memory extraction returned nothing (timed out or empty).',
+            source: 'Memory');
+        return;
+      }
       extracted = extracted.trim();
 
       final parsed = _parseExtractionJson(extracted);
@@ -700,7 +848,14 @@ class ChatController extends GetxController {
       // truncated-mid-object case; if even that comes back empty, there's
       // nothing safe to save from this turn.
       final looksLikeBrokenJson = parsed == null && extracted.trimLeft().startsWith('{');
-      if (looksLikeBrokenJson) return;
+      if (looksLikeBrokenJson) {
+        _log?.warn(
+          'Memory extraction discarded: model produced malformed JSON: '
+          '${extracted.length > 200 ? '${extracted.substring(0, 200)}…' : extracted}',
+          source: 'Memory',
+        );
+        return;
+      }
 
       final noteText = parsed?.text ?? extracted;
       final category = parsed?.category ?? 'general';
@@ -719,11 +874,20 @@ class ChatController extends GetxController {
       // on the actual candidate text — a malformed-JSON model that still
       // wrote "NONE" as its `text` field (or the whole raw response, if
       // parsing failed outright) is still correctly recognized as empty.
-      if (MemoryHeuristics.isNoMemorySentinel(noteText)) return;
+      if (MemoryHeuristics.isNoMemorySentinel(noteText)) {
+        _log?.info(
+          'Memory extraction found nothing durable in this turn.',
+          source: 'Memory',
+        );
+        return;
+      }
 
       final vector = await _embedding.embed(noteText);
-      if (vector == null) return;
-
+      if (vector == null) {
+        _log?.warn('Memory extraction discarded: embedding failed for "$noteText".',
+            source: 'Memory');
+        return;
+      }
       if (contradictedMemory != null) {
         // A correction must always create a fresh, superseding memory —
         // never go through addIfNotDuplicate's near-duplicate check here.
@@ -743,9 +907,12 @@ class ChatController extends GetxController {
         );
         if (newId != null) {
           await _memory.markSuperseded(contradictedMemory.id, newId);
+          _log?.info('Memory updated (superseded prior entry): "$noteText" ($category/$valence)',
+              source: 'Memory');
+          _toast('Memory updated: ${_truncateForToast(noteText)}');
         }
       } else {
-        await _memory.addIfNotDuplicate(
+        final result = await _memory.addIfNotDuplicate(
           noteText,
           vector,
           sourceChatId: chatId,
@@ -753,9 +920,19 @@ class ChatController extends GetxController {
           valence: valence,
           tags: tags,
         );
+        if (result.wasNew) {
+          _log?.info('Memory saved: "$noteText" ($category/$valence)', source: 'Memory');
+          _toast('Memory saved: ${_truncateForToast(noteText)}');
+        } else {
+          _log?.info('Memory reinforced (already known): "$noteText"', source: 'Memory');
+        }
       }
-    } catch (_) {
-      // Best-effort background task — never let this affect the chat UI.
+    } catch (e) {
+      // Best-effort background task — never let this affect the chat UI,
+      // but still log it so a silent failure here is diagnosable from the
+      // in-app log screen instead of just presenting as "memory never
+      // saves anything" with no visible cause.
+      _log?.error('Memory extraction failed: $e', source: 'Memory');
     }
   }
 
@@ -864,6 +1041,7 @@ class ChatController extends GetxController {
   @override
   void onClose() {
     _genSub?.cancel();
+    _memorySweepTimer?.cancel();
     super.onClose();
   }
 }

@@ -1350,6 +1350,19 @@ class _PersistentMemoryCardState extends State<_PersistentMemoryCard> {
                   ],
                 );
               }),
+              const SizedBox(height: 16),
+              Text('Memory Health Sweep',
+                  style: TextStyle(color: context.text, fontSize: 14)),
+              const SizedBox(height: 4),
+              Text(
+                'Periodically verifies every configured model is actually '
+                'loaded and flushes any pending memory write to disk — '
+                'surfaces a warning if something silently fell out of '
+                'memory. Set to 0 to disable.',
+                style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+              ),
+              const SizedBox(height: 8),
+              _SweepIntervalRow(storage: widget.storage),
             ],
           ),
         );
@@ -1430,6 +1443,58 @@ class _PersistentMemoryCardState extends State<_PersistentMemoryCard> {
         borderRadius: BorderRadius.circular(12),
       ),
       child: child,
+    );
+  }
+}
+
+/// Stepper for the memory-health sweep interval (minutes; 0 = off).
+/// Reschedules the live timer on ChatController immediately on change,
+/// rather than only taking effect after an app restart.
+class _SweepIntervalRow extends StatefulWidget {
+  final ChatStorageService storage;
+  const _SweepIntervalRow({required this.storage});
+
+  @override
+  State<_SweepIntervalRow> createState() => _SweepIntervalRowState();
+}
+
+class _SweepIntervalRowState extends State<_SweepIntervalRow> {
+  late int _minutes;
+
+  @override
+  void initState() {
+    super.initState();
+    _minutes = widget.storage.memorySweepIntervalMinutes;
+  }
+
+  void _set(int value) {
+    final clamped = value.clamp(0, 180);
+    setState(() => _minutes = clamped);
+    widget.storage.memorySweepIntervalMinutes = clamped;
+    try {
+      Get.find<ChatController>().rescheduleMemorySweep();
+    } catch (_) {}
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            _minutes <= 0 ? 'Disabled' : 'Every $_minutes min',
+            style: TextStyle(color: context.text, fontSize: 13),
+          ),
+        ),
+        IconButton(
+          icon: Icon(Icons.remove_circle_outline, size: 20, color: context.textM),
+          onPressed: () => _set(_minutes - 5),
+        ),
+        IconButton(
+          icon: Icon(Icons.add_circle_outline, size: 20, color: context.textM),
+          onPressed: () => _set(_minutes + 5),
+        ),
+      ],
     );
   }
 }

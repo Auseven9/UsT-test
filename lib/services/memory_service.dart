@@ -362,6 +362,17 @@ class MemoryService extends GetxService {
     });
   }
 
+  /// Forces any pending debounced reinforcement write to disk right now,
+  /// rather than waiting out the timer — used by the periodic memory-health
+  /// sweep so "verify memory" also means "make sure it's actually durable",
+  /// not just correct in memory.
+  Future<void> flushPending() async {
+    if (_reinforcementPersistTimer?.isActive ?? false) {
+      _reinforcementPersistTimer!.cancel();
+      await _persist();
+    }
+  }
+
   double _cosineSimilarity(List<double> a, List<double> b) {
     if (a.isEmpty || b.isEmpty || a.length != b.length) return 0.0;
     var dot = 0.0, normA = 0.0, normB = 0.0;

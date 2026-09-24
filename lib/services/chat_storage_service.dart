@@ -136,6 +136,18 @@ class ChatStorageService extends GetxService {
 
   set helperModelFilename(String value) => _settingsBox.put('helper_model', value);
 
+  /// Minutes between periodic memory-health sweeps (flush any pending write,
+  /// re-verify each model's loaded/armed state, surface anything wrong) — 0
+  /// disables the sweep entirely. Tunable since the right cadence trades off
+  /// against battery on a phone; the sweep itself is cheap (no inference),
+  /// so a short interval is safe, just wasteful if there's nothing to check.
+  int get memorySweepIntervalMinutes =>
+      (_settingsBox.get('memory_sweep_interval_minutes', defaultValue: 10) as num)
+          .toInt();
+
+  set memorySweepIntervalMinutes(int value) =>
+      _settingsBox.put('memory_sweep_interval_minutes', value);
+
   // ── Context & Sampling ──────────────────────────────────────
 
   /// Context window size (n_ctx) applied at model load time. Raised from

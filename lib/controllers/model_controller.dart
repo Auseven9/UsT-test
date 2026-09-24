@@ -46,6 +46,14 @@ class ModelController extends GetxController {
   bool get isHelperModelLoaded => _helper.isLoaded.value;
   String get loadedHelperModelFilename => _helper.loadedModelFilename;
 
+  LogService? get _log {
+    try {
+      return Get.find<LogService>();
+    } catch (_) {
+      return null;
+    }
+  }
+
   @override
   void onInit() {
     super.onInit();
@@ -77,19 +85,17 @@ class ModelController extends GetxController {
     final confirmed = await _confirmLargeModel(model.sizeGb);
     if (!confirmed) return;
 
-    LogService? log;
-    try { log = Get.find<LogService>(); } catch (_) {}
-    log?.info('Starting download: ${model.name} (${model.sizeGb} GB)', source: 'Download');
+    _log?.info('Starting download: ${model.name} (${model.sizeGb} GB)', source: 'Download');
     try {
       await _manager.downloadModel(model);
-      log?.info('Download complete: ${model.name}', source: 'Download');
+      _log?.info('Download complete: ${model.name}', source: 'Download');
       Get.snackbar(
         'Download Complete',
         '${model.name} is ready!',
         snackPosition: SnackPosition.BOTTOM,
       );
     } catch (e) {
-      log?.error('Download failed: ${model.name} — $e', source: 'Download');
+      _log?.error('Download failed: ${model.name} — $e', source: 'Download');
       Get.snackbar(
         'Download Failed',
         e.toString(),
@@ -161,11 +167,17 @@ class ModelController extends GetxController {
 
       selectedModelFilename.value = filename;
       _storage.lastModelId = filename;
+
+      _log?.info('Chat model armed: $filename', source: 'Model');
+      Get.snackbar(
+        'Model Armed',
+        '$filename is loaded and ready.',
+        snackPosition: SnackPosition.BOTTOM,
+        duration: const Duration(seconds: 2),
+      );
     } catch (e) {
       loadError.value = e.toString();
-      LogService? log;
-      try { log = Get.find<LogService>(); } catch (_) {}
-      log?.error('Load failed: $filename — $e', source: 'Model');
+      _log?.error('Load failed: $filename — $e', source: 'Model');
       Get.snackbar(
         'Load Failed',
         e.toString(),
@@ -518,12 +530,14 @@ class ModelController extends GetxController {
       final path = _manager.getModelPathByFilename(filename);
       await _embedding.loadModel(path);
       _storage.memoryEmbeddingModelFilename = filename;
+      _log?.info('Embedding model armed: $filename', source: 'Model');
       Get.snackbar(
         'Memory Model Set',
         '$filename will be used for persistent memory retrieval.',
         snackPosition: SnackPosition.BOTTOM,
       );
     } catch (e) {
+      _log?.error('Embedding model load failed: $filename — $e', source: 'Model');
       Get.snackbar(
         'Load Failed',
         e.toString(),
@@ -540,12 +554,14 @@ class ModelController extends GetxController {
       final path = _manager.getModelPathByFilename(filename);
       await _helper.loadModel(path);
       _storage.helperModelFilename = filename;
+      _log?.info('Helper model armed: $filename', source: 'Model');
       Get.snackbar(
         'Helper Model Set',
         '$filename will handle background memory extraction.',
         snackPosition: SnackPosition.BOTTOM,
       );
     } catch (e) {
+      _log?.error('Helper model load failed: $filename — $e', source: 'Model');
       Get.snackbar(
         'Load Failed',
         e.toString(),

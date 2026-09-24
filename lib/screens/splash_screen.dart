@@ -46,7 +46,18 @@ class _SplashScreenState extends State<SplashScreen> {
 
       setState(() => _status = 'Preparing AI engine...');
       log.info('Preparing AI engine...', source: 'Splash');
-      await Get.find<LlmService>().init();
+      final llm = await Get.find<LlmService>().init();
+
+      // Must run before any model load below: loadModel() can call
+      // WakelockService.enableForInference(), which starts the Android
+      // foreground-service notification — that requires the notification
+      // channel WakelockService.init() registers. Restoring the last chat
+      // model at splash time, before this ran, meant the very first (and
+      // heaviest/longest) load of the app's lifecycle silently lost its
+      // OS-kill protection with no visible error anywhere.
+      setState(() => _status = 'Setting up background services...');
+      log.info('Setting up background services...', source: 'Splash');
+      await Get.find<WakelockService>().init();
 
       setState(() => _status = 'Setting up memory...');
       log.info('Setting up persistent memory...', source: 'Splash');
@@ -55,10 +66,25 @@ class _SplashScreenState extends State<SplashScreen> {
       final helper = await Get.find<HelperLlmService>().init();
       log.info('${memory.entries.length} memories loaded', source: 'Splash');
 
+      // Restore the last-loaded chat model across restarts. Without this the
+      // header silently reverts to "No model selected" after every relaunch
+      // even though the app still remembers which model was selected —
+      // matching the restoration already done below for the embedding and
+      // helper models, so all three behave the same way across a restart.
+      final storage = Get.find<ChatStorageService>();
+      if (storage.lastModelId.isNotEmpty) {
+        setState(() => _status = 'Reloading last model...');
+        try {
+          final path = modelManager.getModelPathByFilename(storage.lastModelId);
+          await llm.loadModel(path);
+        } catch (e) {
+          log.error('Could not restore chat model: $e', source: 'Splash');
+        }
+      }
+
       // Restore the embedding model across restarts, same as the local API
       // server restores its own enabled state — otherwise persistent memory
       // would silently stop retrieving anything after every app relaunch.
-      final storage = Get.find<ChatStorageService>();
       if (storage.persistentMemoryEnabled &&
           storage.memoryEmbeddingModelFilename.isNotEmpty) {
         try {
@@ -88,10 +114,6 @@ class _SplashScreenState extends State<SplashScreen> {
       setState(() => _status = 'Preparing local API...');
       log.info('Preparing local API...', source: 'Splash');
       await Get.find<LocalApiServerService>().init();
-
-      setState(() => _status = 'Setting up background services...');
-      log.info('Setting up background services...', source: 'Splash');
-      await Get.find<WakelockService>().init();
 
       setState(() => _status = 'Ready!');
       log.info('All services initialized successfully', source: 'Splash');
