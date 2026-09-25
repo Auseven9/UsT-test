@@ -8,6 +8,7 @@ import 'package:get/get.dart';
 import '../theme/app_colors.dart';
 import '../models/message_model.dart';
 import '../services/llm_service.dart';
+import 'turn_insight_panel.dart';
 
 class ChatBubble extends StatelessWidget {
   final MessageModel message;
@@ -94,6 +95,8 @@ class ChatBubble extends StatelessWidget {
       children: [
         if (message.reasoning != null && message.reasoning!.isNotEmpty)
           _ThoughtsSection(reasoning: message.reasoning!),
+        if (message.telemetry != null)
+          TurnInsightPanel(telemetry: message.telemetry!),
         Padding(
           padding: const EdgeInsets.only(top: 3),
           child: MarkdownBody(

@@ -4,6 +4,7 @@ import 'package:get/get.dart';
 import '../theme/app_colors.dart';
 import '../models/memory_entry.dart';
 import '../services/memory_service.dart';
+import '../routes/app_routes.dart';
 
 /// Browser for the persistent memory directory — every distilled note the
 /// app has stored across conversations, with the ability to delete
@@ -46,6 +47,15 @@ class MemoryScreen extends StatelessWidget {
                     ),
                   ),
                   const Spacer(),
+                  Obx(
+                    () => IconButton(
+                      icon: Icon(Icons.hub_outlined, size: 20, color: context.textD),
+                      tooltip: 'View as graph',
+                      onPressed: memory.entries.isEmpty
+                          ? null
+                          : () => Get.toNamed(AppRoutes.memoryGraph),
+                    ),
+                  ),
                   Obx(
                     () => IconButton(
                       icon: Icon(Icons.delete_sweep_outlined,
@@ -230,6 +240,8 @@ class _MemoryTile extends StatelessWidget {
         return AppColors.orange;
       case 'instruction':
         return AppColors.accentHi;
+      case 'summary':
+        return AppColors.accentDim;
       default:
         return context.textM;
     }

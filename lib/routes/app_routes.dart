@@ -7,6 +7,7 @@ import '../screens/settings_screen.dart';
 import '../screens/api_endpoints_screen.dart';
 import '../screens/logs_screen.dart';
 import '../screens/memory_screen.dart';
+import '../screens/memory_graph_screen.dart';
 import '../screens/crash_log_screen.dart';
 import '../screens/resource_monitor_screen.dart';
 
@@ -18,6 +19,7 @@ class AppRoutes {
   static const apiEndpoints = '/api-endpoints';
   static const logs = '/logs';
   static const memory = '/memory';
+  static const memoryGraph = '/memory-graph';
   static const crashLog = '/crash-log';
   static const resourceMonitor = '/resource-monitor';
 
@@ -47,6 +49,11 @@ class AppRoutes {
     GetPage(
       name: memory,
       page: () => const MemoryScreen(),
+      transition: Transition.rightToLeft,
+    ),
+    GetPage(
+      name: memoryGraph,
+      page: () => const MemoryGraphScreen(),
       transition: Transition.rightToLeft,
     ),
     GetPage(

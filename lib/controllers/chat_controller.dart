@@ -2,13 +2,14 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
-import 'package:flutter/widgets.dart' show EdgeInsets;
+import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:llamadart/llamadart.dart';
 
 import '../models/chat_model.dart';
 import '../models/message_model.dart';
 import '../models/memory_entry.dart';
+import '../models/turn_telemetry.dart';
 import '../services/llm_service.dart';
 import '../services/chat_storage_service.dart';
 import '../services/embedding_service.dart';
@@ -38,6 +39,23 @@ const _imageTokenReserve = 1024;
 /// far — a model that keeps calling tools instead of answering shouldn't be
 /// able to turn one message into an unbounded battery/time sink on a phone.
 const _maxToolRounds = 3;
+
+/// The judgment-call portion of the memory-extraction prompt — what counts
+/// as "worth remembering". Exposed (via [ChatStorageService.
+/// memoryExtractionGuidance]) as a Settings-editable override, same tier as
+/// the main chat system prompt, so a user who wants different judgment
+/// (more/less eager, different categories emphasized) doesn't have to guess
+/// blind at heuristic thresholds — they can just read and rewrite what the
+/// extraction model is actually told. Public so the Settings screen can
+/// show it as the placeholder/reset target.
+const defaultMemoryExtractionGuidance =
+    'You watch one exchange from a conversation and extract durable facts '
+    'or preferences worth remembering in future, unrelated conversations — '
+    'things like the user\'s name, stated preferences, ongoing projects, '
+    'personal details, or something they explicitly asked to be remembered '
+    '(if they said "remember that" or similar, figure out from the '
+    'exchange what "that" refers to and capture the actual content, not '
+    'the instruction itself).';
 
 class ChatController extends GetxController {
   final LlmService _llm = Get.find<LlmService>();
@@ -120,40 +138,250 @@ class ChatController extends GetxController {
     _memorySweepTimer?.cancel();
     final minutes = _storage.memorySweepIntervalMinutes;
     if (minutes <= 0) return;
-    _memorySweepTimer =
-        Timer.periodic(Duration(minutes: minutes), (_) => _runMemorySweep());
+    _memorySweepTimer = Timer.periodic(
+      Duration(minutes: minutes),
+      (_) => _confirmAndRunMemorySweep(),
+    );
   }
 
   /// Public so Settings can call it right after the user changes the sweep
   /// interval, instead of the new value only taking effect on next launch.
   void rescheduleMemorySweep() => _scheduleMemorySweep();
 
-  /// Periodic "is everything actually working" check — verifies each model
-  /// the app is configured to use is genuinely loaded (armed), and flushes
-  /// any pending debounced memory write to disk. Cheap: it only reads
-  /// in-memory flags and does a file write, no model inference, so a short
-  /// interval doesn't cost battery the way an actual probe generation would.
+  /// Asks the user before every sweep — the sweep now does a real probe
+  /// generation call (see [_runMemorySweep]), not just a flag check, so it's
+  /// no longer free enough to run silently on a timer without consent.
+  /// Declining just skips this cycle; the next tick asks again.
+  Future<void> _confirmAndRunMemorySweep() async {
+    // Never interrupt an in-progress reply with an uninvited dialog — skip
+    // this cycle silently rather than popping a barrier-blocking prompt
+    // over an actively streaming response. The next tick tries again.
+    if (isGenerating.value) {
+      _log?.info('Memory sweep skipped — a reply is in progress.', source: 'Memory');
+      return;
+    }
+    final accepted = await _askSweepConsent();
+    if (!accepted) {
+      _log?.info('Memory sweep declined for this cycle.', source: 'Memory');
+      return;
+    }
+    // Re-check rather than trust the pre-dialog snapshot — up to 20s can
+    // pass while the consent dialog sits open, plenty of time for the user
+    // to have started (or resumed) a reply since the first check above.
+    if (isGenerating.value) {
+      _log?.info(
+        'Memory sweep skipped — a reply started while the consent dialog was open.',
+        source: 'Memory',
+      );
+      return;
+    }
+    await _runMemorySweep();
+  }
+
+  Future<bool> _askSweepConsent() async {
+    final completer = Completer<bool>();
+    var responded = false;
+    void respond(bool value) {
+      if (responded) return;
+      responded = true;
+      if (Get.isDialogOpen ?? false) Get.back();
+      completer.complete(value);
+    }
+
+    try {
+      unawaited(Get.dialog(
+        AlertDialog(
+          title: const Text('Run memory sweep?'),
+          content: const Text(
+            'Verifies each configured model is actually armed, probes the '
+            'embedding model with a real request, and flushes any pending '
+            'memory write to disk. If everything checks out and a helper '
+            'model is armed, it also runs one more short generation to '
+            'look for connections across recent memories — which can add '
+            'a new note of its own.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => respond(false),
+              child: const Text('Not now'),
+            ),
+            ElevatedButton(
+              onPressed: () => respond(true),
+              child: const Text('Run sweep'),
+            ),
+          ],
+        ),
+        barrierDismissible: false,
+      ));
+    } catch (_) {
+      // No overlay currently mounted (app backgrounded, no active route) —
+      // skip this cycle rather than hang waiting for a dialog no one can see.
+      return false;
+    }
+    // Don't leave a dialog sitting unanswered forever if the user's
+    // attention is elsewhere — default to declined and dismiss it.
+    Timer(const Duration(seconds: 20), () => respond(false));
+    return completer.future;
+  }
+
+  /// "Is everything actually working" check, run only after the user
+  /// accepts the prompt above. Verifies each model the app is configured to
+  /// use is genuinely loaded (armed), does a real embedding call to confirm
+  /// the embedding model actually responds (not just reports itself
+  /// loaded), and flushes any pending debounced memory write to disk.
   Future<void> _runMemorySweep() async {
     _log?.info('Memory sweep starting...', source: 'Memory');
     final problems = <String>[];
     if (!_llm.isLoaded.value) problems.add('main model not armed');
     if (_storage.persistentMemoryEnabled) {
-      if (!_embedding.isLoaded.value) problems.add('embedding model not armed');
+      if (!_embedding.isLoaded.value) {
+        problems.add('embedding model not armed');
+      } else {
+        final probe = await _embedding.embed('memory sweep self-test');
+        if (probe == null || probe.isEmpty) {
+          problems.add('embedding model armed but not responding to requests');
+        } else {
+          _log?.info(
+            'Embedding probe OK — ${probe.length}-dim vector returned.',
+            source: 'Memory',
+          );
+        }
+      }
       if (_storage.helperModelFilename.isNotEmpty && !_helper.isLoaded.value) {
         problems.add('helper model not armed (falling back to main model)');
       }
     }
     await _memory.flushPending();
     if (problems.isEmpty) {
-      _log?.info(
-        'Memory sweep OK — all configured models armed, '
-        '${_memory.entries.length} memories on disk.',
-        source: 'Memory',
-      );
+      // Say only what was actually checked — with Persistent Memory off,
+      // the whole embedding/helper block above never ran; and even with it
+      // on, only the embedding model gets a real request/response probe —
+      // the main and helper models are only confirmed *loaded*, not
+      // exercised with a generation, so "armed and responding" would
+      // overstate what this pass verified for those two.
+      final helperNote = _storage.helperModelFilename.isEmpty
+          ? 'no helper model configured'
+          : 'helper model armed';
+      final msg = _storage.persistentMemoryEnabled
+          ? 'Memory sweep OK — main model armed, embedding model armed and '
+              'responding to a real request, $helperNote, '
+              '${_memory.entries.length} memories on disk.'
+          : 'Memory sweep OK — main model armed (Persistent Memory is off, '
+              'so memory models weren\'t checked).';
+      // Log only — the user already opted into this exact run via the
+      // consent dialog a moment ago, so a success toast on top of that
+      // would be a second interruption for a result that isn't actionable.
+      // A problem is still worth toasting since it needs attention.
+      _log?.info(msg, source: 'Memory');
     } else {
       final msg = 'Memory sweep found issues: ${problems.join(', ')}.';
       _log?.warn(msg, source: 'Memory');
       _toast(msg);
+    }
+    // Only attempt consolidation once the sweep above confirms everything's
+    // actually healthy — no point spending a generation looking for
+    // connections across memory on top of a setup that's already known to
+    // be broken.
+    if (problems.isEmpty) {
+      await _runMemoryConsolidation();
+    }
+  }
+
+  /// Looks at a handful of the most recently-touched memories together and
+  /// asks the helper model whether any of them are genuinely connected —
+  /// the same person/project mentioned in two separate notes, or one that
+  /// adds context to another — writing a short new note capturing that
+  /// link if so. This is the "the embedding model takes a little turn at
+  /// the end of each sweep" consolidation pass: distinct from per-turn
+  /// extraction (which only ever looks at one exchange in isolation and
+  /// can't notice a connection spanning multiple past conversations).
+  /// Bounded and cheap: one short generation, only ever run as part of an
+  /// already-user-approved sweep, and skipped outright if there isn't
+  /// enough in memory yet for a connection to even be possible.
+  Future<void> _runMemoryConsolidation() async {
+    if (!_storage.persistentMemoryEnabled ||
+        !_embedding.isLoaded.value ||
+        !_helper.isLoaded.value) {
+      return;
+    }
+    // The helper engine has exactly one generation slot. If a per-turn
+    // extraction call (see _extractAndRememberFromTurn) happens to be
+    // in flight right now, calling complete() here would just get back a
+    // silent null — worse, it would occupy the slot the moment the
+    // in-flight call finishes, right as the NEXT turn's extraction might
+    // want it. Defer entirely rather than contend for it; the next sweep
+    // (only after the user approves it again) gets another chance.
+    if (_helper.isBusy) {
+      _log?.info('Memory consolidation skipped — helper model busy.', source: 'Memory');
+      return;
+    }
+    final active = _memory.entries.where((e) => e.isActive).toList()
+      ..sort((a, b) => b.lastAccessedAt.compareTo(a.lastAccessedAt));
+    if (active.length < 3) return;
+
+    final sample = active.take(6).toList();
+    // Capped per entry, same as the extraction prompt's `capMemoryText` —
+    // nothing here guarantees a stored memory stayed short (the enrichment
+    // path in MemoryService.addIfNotDuplicate can grow one substantially),
+    // and this listing has no other bound before it goes into a fixed
+    // 2048-token helper context alongside the rest of the prompt.
+    final listing = sample
+        .indexed
+        .map((e) => '${e.$1 + 1}. ${_capMemoryText(e.$2.text)}')
+        .join('\n');
+
+    final request = <LlamaChatMessage>[
+      LlamaChatMessage.fromText(
+        role: LlamaChatRole.system,
+        text: 'You review a handful of previously remembered notes and '
+            'look for one genuine connection worth recording — e.g. two '
+            'notes that are about the same person or project, or one that '
+            'adds context to another. If you find a real connection, '
+            'respond with ONLY a single short sentence capturing it. If '
+            'nothing meaningfully connects, respond with exactly NONE.',
+      ),
+      LlamaChatMessage.fromText(role: LlamaChatRole.user, text: listing),
+    ];
+
+    String? out;
+    try {
+      out = await _helper.complete(request, maxTokens: 60).timeout(const Duration(seconds: 25));
+    } on TimeoutException {
+      _helper.stopGeneration();
+      _log?.warn('Memory consolidation timed out.', source: 'Memory');
+      return;
+    }
+    if (out == null) return;
+    out = out.trim();
+    if (MemoryHeuristics.isNoMemorySentinel(out)) {
+      _log?.info('Memory consolidation: nothing to connect.', source: 'Memory');
+      return;
+    }
+
+    final vector = await _embedding.embed(out);
+    if (vector == null) return;
+    final result = await _memory.addIfNotDuplicate(
+      out,
+      vector,
+      category: 'summary',
+      valence: 'neutral',
+      tags: const ['consolidation'],
+      // Only dedupe against other consolidation notes — a connecting
+      // sentence is EXPECTED to score similar to the source memories it
+      // connects (that's the whole point), so checking it against those
+      // too would routinely misfire as "duplicate" and get it silently
+      // discarded as a reinforcement of one of the facts it's summarizing
+      // instead of stored as the new note it actually is.
+      scope: (e) => e.tags.contains('consolidation'),
+    );
+    if (result.wasNew) {
+      _log?.info('Memory consolidation wrote a new note: "$out"', source: 'Memory');
+      _toast('Memory consolidated: ${_truncateForToast(out)}');
+    } else if (result.wasEnriched) {
+      _log?.info('Memory consolidation enriched an existing note: "$out"', source: 'Memory');
+      _toast('Memory consolidated: ${_truncateForToast(out)}');
+    } else {
+      _log?.info('Memory consolidation: reinforced existing note.', source: 'Memory');
     }
   }
 
@@ -172,7 +400,23 @@ class ChatController extends GetxController {
     } catch (_) {}
   }
 
-  String _truncateForToast(String s) => s.length > 60 ? '${s.substring(0, 60)}…' : s;
+  /// Shared ellipsis-truncation for every "cap this before it goes
+  /// somewhere length-sensitive" spot in this file — a toast (kept short:
+  /// 60 chars), the exportable log (200: tool call args/results can carry
+  /// arbitrary, potentially sensitive content — e.g. memory text echoed
+  /// back by search_memory — straight into a buffer the user can copy/
+  /// share wholesale from the Log screen), or a memory-extraction/
+  /// consolidation prompt (150: these notes are themselves distilled to
+  /// one short sentence, but capped defensively anyway since nothing
+  /// guarantees an old one — especially one recovered via the truncated-
+  /// JSON fallback elsewhere in this file, or grown by the enrichment path
+  /// in MemoryService.addIfNotDuplicate — actually stayed short).
+  String _cap(String s, int maxLength) =>
+      s.length > maxLength ? '${s.substring(0, maxLength)}…' : s;
+
+  String _truncateForToast(String s) => _cap(s, 60);
+  String _capForLog(String s) => _cap(s, 200);
+  String _capMemoryText(String s) => _cap(s, 150);
 
   void _loadChats() {
     chats.value = _storage.getAllChats();
@@ -378,6 +622,8 @@ class ChatController extends GetxController {
     streamedReasoning.value = '';
 
     final aiMsg = MessageModel(role: MessageRole.assistant, content: '');
+    aiMsg.telemetry = TurnTelemetry()
+      ..setContextUsage(fitResult.historyTokens, fitResult.contextSize);
     chat.messages.add(aiMsg);
     chats.refresh();
 
@@ -411,6 +657,7 @@ class ChatController extends GetxController {
           );
           roundMessages = refit.messages;
           responseBudget = refit.responseBudget.clamp(1, _maxResponseTokens);
+          aiMsg.telemetry?.setContextUsage(refit.historyTokens, refit.contextSize);
         }
         exhaustedRounds = round == _maxToolRounds - 1;
 
@@ -464,13 +711,29 @@ class ChatController extends GetxController {
               break;
             }
           }
+          _log?.info('Tool call: ${c.name}(${_capForLog(c.rawArgs)})', source: 'Tools');
           Object? result;
           try {
             result = tool == null
                 ? {'error': 'Unknown tool "${c.name}"'}
                 : await tool.invoke(c.args);
+            _log?.info(
+              'Tool result: ${c.name} -> ${_capForLog(result.toString())}',
+              source: 'Tools',
+            );
+            // A tool can fail internally without throwing (e.g. `calculate`
+            // catches a malformed expression and returns {'error': ...}
+            // rather than letting the exception propagate) — telemetry
+            // needs to reflect that as a failure too, not just "no tool
+            // found" or "threw", or the insight panel's tool chip would
+            // show green for a call the model was actually told failed.
+            final succeeded = tool != null &&
+                !(result is Map && result.containsKey('error'));
+            aiMsg.telemetry?.addToolCall(c.name, succeeded: succeeded);
           } catch (e) {
             result = {'error': e.toString()};
+            _log?.error('Tool failed: ${c.name} -> $e', source: 'Tools');
+            aiMsg.telemetry?.addToolCall(c.name, succeeded: false);
           }
           return LlamaChatMessage.withContent(
             role: LlamaChatRole.tool,
@@ -502,6 +765,7 @@ class ChatController extends GetxController {
         );
         roundMessages = refit.messages;
         responseBudget = refit.responseBudget.clamp(1, _maxResponseTokens);
+        aiMsg.telemetry?.setContextUsage(refit.historyTokens, refit.contextSize);
         if (streamedResponse.value.isNotEmpty) pendingRoundSeparator[0] = true;
         if (streamedReasoning.value.isNotEmpty) pendingRoundSeparator[1] = true;
         await _streamGeneration(
@@ -517,12 +781,43 @@ class ChatController extends GetxController {
         aiMsg.content = '⚠ Error: ${e.toString()}';
       }
     } finally {
-      // Defensive fallback for a model whose chat template llamadart didn't
-      // recognize (native `thinking` stayed empty even though this specific
-      // reply clearly reasoned before answering): split any leaked
-      // control-token-looking text out of the final content rather than
-      // showing it raw. A no-op when native separation already worked.
-      if ((aiMsg.reasoning == null || aiMsg.reasoning!.isEmpty) &&
+      // Two distinct failure shapes for a model whose chat template
+      // llamadart doesn't cleanly recognize (custom/community fine-tunes —
+      // e.g. Alesis's malformed `<|channel>`/`<channel|>` markers, missing
+      // a pipe on one side of the real `<|channel|>` form): either the
+      // *content* channel ends up holding everything (native `thinking`
+      // stayed empty), or — worse, and previously unhandled — the
+      // *thinking* channel ends up holding everything INCLUDING the real
+      // final answer, leaving `content` completely empty. The second shape
+      // is why a reply could show its whole answer trapped inside the
+      // collapsed Thoughts panel with the raw markers still visible: this
+      // fallback only ever checked the first shape.
+      final rawReasoning = aiMsg.reasoning;
+      if (rawReasoning != null &&
+          rawReasoning.isNotEmpty &&
+          aiMsg.content.trim().isEmpty &&
+          LlmService.containsLeakedControlTokens(rawReasoning)) {
+        final split = LlmService.splitLeakedControlTokens(
+          rawReasoning,
+          wasTruncated: _llm.lastGenerationHitTokenCap.value,
+          assumeWholeTextIsAnswerIfNothingTrails: false,
+        );
+        aiMsg.reasoning = split.reasoning;
+        // An empty answer here can mean two different things, unlike the
+        // content-based fallback below: generation genuinely got cut off
+        // mid-thought (wasTruncated), OR generation finished normally but
+        // nothing recognizable as a distinct final answer followed the
+        // last marker in the reasoning text (assumeWholeTextIsAnswerIfNothingTrails:
+        // false always returns empty in that case, truncated or not) — the
+        // model wasn't cut off, its answer is just unrecoverable from the
+        // malformed output. Claiming "cut off" for the second case would be
+        // a wrong diagnosis, not just an unhelpful one.
+        aiMsg.content = split.answer.isNotEmpty
+            ? split.answer
+            : (_llm.lastGenerationHitTokenCap.value
+                ? '_(cut off before finishing — see Thoughts above)_'
+                : '_(no distinct answer found — see Thoughts above)_');
+      } else if ((aiMsg.reasoning == null || aiMsg.reasoning!.isEmpty) &&
           aiMsg.content.isNotEmpty) {
         final split = LlmService.splitLeakedControlTokens(
           aiMsg.content,
@@ -625,7 +920,12 @@ class ChatController extends GetxController {
     );
 
     List<LlamaCompletionChunkToolCall>? toolCalls;
+    // Real wall-clock spacing between chunks as they actually arrive — the
+    // cadence spectrograph's only data source. Reset per call (per round),
+    // same scope as _llm.lastGenerationTokens below.
+    DateTime? lastChunkAt;
     await for (final chunk in stream) {
+      final now = DateTime.now();
       if (chunk.thinking.isNotEmpty) {
         if (separatorBox[1]) {
           streamedReasoning.value += '\n\n---\n\n';
@@ -633,6 +933,11 @@ class ChatController extends GetxController {
         }
         streamedReasoning.value += chunk.thinking;
         aiMsg.reasoning = streamedReasoning.value;
+        aiMsg.telemetry?.addCadenceSample(
+          true,
+          lastChunkAt == null ? 0 : now.difference(lastChunkAt).inMicroseconds / 1000,
+        );
+        lastChunkAt = now;
       }
       if (chunk.content.isNotEmpty) {
         if (separatorBox[0]) {
@@ -641,12 +946,21 @@ class ChatController extends GetxController {
         }
         streamedResponse.value += chunk.content;
         aiMsg.content = streamedResponse.value;
+        aiMsg.telemetry?.addCadenceSample(
+          false,
+          lastChunkAt == null ? 0 : now.difference(lastChunkAt).inMicroseconds / 1000,
+        );
+        lastChunkAt = now;
       }
       if (chunk.toolCalls != null && chunk.toolCalls!.isNotEmpty) {
         toolCalls = chunk.toolCalls;
       }
       chats.refresh();
     }
+    // A real per-round token count, read from the same counter
+    // generateChatCompletion just finished updating for exactly this call —
+    // not an estimate, the actual count llama.cpp reported for this round.
+    aiMsg.telemetry?.addRoundTokens(_llm.lastGenerationTokens.value);
     return toolCalls;
   }
 
@@ -713,12 +1027,25 @@ class ChatController extends GetxController {
       final extractionContextEstimate =
           useHelper ? 2048 : (await _llm.getContextSize()).clamp(256, 2048);
       const approxCharsPerToken = 4;
-      // System prompt + JSON-format instructions + trailing instruction —
-      // the JSON-structured extraction prompt roughly doubled this versus
-      // the old one-sentence version, so the old flat 150 badly
-      // undercounted real overhead once the "already remembered" context
-      // block is added below too.
-      const overheadTokens = 350;
+
+      // Computed here (rather than where it's used, below) because its
+      // length feeds directly into the overhead estimate right after —
+      // this is now a Settings-editable field with no length limit at the
+      // storage layer, so a long custom override has to actually be
+      // accounted for, not just the roughly-fixed size of the built-in
+      // default this replaced.
+      final customGuidance = _storage.memoryExtractionGuidance.trim();
+      final guidance =
+          customGuidance.isEmpty ? defaultMemoryExtractionGuidance : customGuidance;
+
+      // JSON-format instructions + trailing overhead is roughly fixed
+      // regardless of guidance (~200 tokens); the guidance text itself is
+      // added on top since it's no longer a fixed size now that it's user-
+      // editable — a long custom override correctly eats into the budget
+      // left for the actual exchange instead of silently overflowing it.
+      const baseOverheadTokens = 200;
+      final guidanceTokens = (guidance.length / approxCharsPerToken).ceil();
+      final overheadTokens = baseOverheadTokens + guidanceTokens;
       final availableTokens =
           (extractionContextEstimate - extractionMaxTokens - overheadTokens)
               .clamp(40, extractionContextEstimate);
@@ -727,12 +1054,6 @@ class ChatController extends GetxController {
       String cap(String s) =>
           s.length > maxCharsEach ? '${s.substring(0, maxCharsEach)}…' : s;
 
-      // Memory notes are themselves distilled to one short sentence, but
-      // capped defensively anyway — this block adds to the same token
-      // budget being carefully bounded above, and nothing guarantees an
-      // old note (especially one recovered via the truncated-JSON fallback
-      // elsewhere in this file) stayed short.
-      String capMemoryText(String s) => s.length > 150 ? '${s.substring(0, 150)}…' : s;
       // Numbered, not bulleted — with more than one memory shown, the model
       // needs to say WHICH one a new fact contradicts (contradicts_index
       // below), not just "yes something was contradicted". A bare boolean
@@ -743,19 +1064,12 @@ class ChatController extends GetxController {
           ? ''
           : '\n\nAlready remembered, for reference — numbered so you can say '
               'which one (if any) the new exchange contradicts/updates (e.g. '
-              'a changed fact):\n${relevantMemories.indexed.map((e) => '${e.$1 + 1}. ${capMemoryText(e.$2.text)}').join('\n')}';
+              'a changed fact):\n${relevantMemories.indexed.map((e) => '${e.$1 + 1}. ${_capMemoryText(e.$2.text)}').join('\n')}';
 
       final extractionRequest = <LlamaChatMessage>[
         LlamaChatMessage.fromText(
           role: LlamaChatRole.system,
-          text: 'You watch one exchange from a conversation and extract '
-              'durable facts or preferences worth remembering in future, '
-              'unrelated conversations — things like the user\'s name, '
-              'stated preferences, ongoing projects, personal details, or '
-              'something they explicitly asked to be remembered (if they '
-              'said "remember that" or similar, figure out from the '
-              'exchange what "that" refers to and capture the actual '
-              'content, not the instruction itself).'
+          text: '$guidance'
               '$existingMemoryContext\n\n'
               'Respond with ONLY a single-line JSON object, no other text: '
               '{"text": "<one short sentence, or empty string if nothing '
@@ -910,6 +1224,7 @@ class ChatController extends GetxController {
           _log?.info('Memory updated (superseded prior entry): "$noteText" ($category/$valence)',
               source: 'Memory');
           _toast('Memory updated: ${_truncateForToast(noteText)}');
+          aiMsg.telemetry?.setExtractedValence(category, valence);
         }
       } else {
         final result = await _memory.addIfNotDuplicate(
@@ -923,7 +1238,16 @@ class ChatController extends GetxController {
         if (result.wasNew) {
           _log?.info('Memory saved: "$noteText" ($category/$valence)', source: 'Memory');
           _toast('Memory saved: ${_truncateForToast(noteText)}');
+          aiMsg.telemetry?.setExtractedValence(category, valence);
+        } else if (result.wasEnriched) {
+          _log?.info('Memory enriched: "$noteText" ($category/$valence)', source: 'Memory');
+          _toast('Memory updated: ${_truncateForToast(noteText)}');
+          aiMsg.telemetry?.setExtractedValence(category, valence);
         } else {
+          // Deliberately no telemetry marker here — this is a pure repeat
+          // of something already known, nothing new was captured, and the
+          // insight panel's "memory captured" chip would be misleading on
+          // a turn where nothing actually changed in memory.
           _log?.info('Memory reinforced (already known): "$noteText"', source: 'Memory');
         }
       }

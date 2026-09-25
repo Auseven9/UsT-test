@@ -122,22 +122,16 @@ class MemoryService extends GetxService {
   }) async {
     if (text.trim().isEmpty || embedding.isEmpty) return null;
 
-    // Link the new node to its nearest existing active neighbors — reusing
-    // the embedding just computed for storage, not a second pass. Bidirectional:
-    // the new node remembers its neighbors, and each of those neighbors gets
-    // the new node added to its own link list, so walking from an old memory
-    // can surface a newer related one too.
-    final scored = <MapEntry<MemoryEntry, double>>[];
-    for (final entry in entries) {
-      if (!entry.isActive) continue;
-      final score = _cosineSimilarity(embedding, entry.embedding);
-      if (score >= _linkThreshold) scored.add(MapEntry(entry, score));
-    }
-    scored.sort((a, b) => b.value.compareTo(a.value));
-    final neighbors = scored.take(_maxLinksPerNode).map((e) => e.key).toList();
+    final id = DateTime.now().microsecondsSinceEpoch.toString();
+    // entryId isn't in `entries` yet at this point, so _relink only ever
+    // adds reverse links to existing neighbors here (nothing to remove) —
+    // same net effect as the original inline version, just shared with the
+    // enrichment path in addIfNotDuplicate, which needs the remove-stale-
+    // links half too when an entry's embedding actually changes.
+    final linkedIds = _relink(id, embedding);
 
-    final newEntry = MemoryEntry(
-      id: DateTime.now().microsecondsSinceEpoch.toString(),
+    entries.add(MemoryEntry(
+      id: id,
       text: text.trim(),
       embedding: embedding,
       createdAt: DateTime.now(),
@@ -145,27 +139,52 @@ class MemoryService extends GetxService {
       category: category,
       valence: valence,
       tags: tags,
-      linkedIds: neighbors.map((n) => n.id).toList(),
-    );
-
-    for (final neighbor in neighbors) {
-      final idx = entries.indexWhere((e) => e.id == neighbor.id);
-      if (idx == -1) continue;
-      // Cap the reverse edge too — without this, a frequently-referenced
-      // memory (e.g. "user's name") accumulates an ever-growing link list
-      // over the app's lifetime, contradicting the "small associative
-      // graph" this is meant to be. Oldest link drops first (FIFO) to make
-      // room, keeping the most recent associations.
-      final updatedLinks = [...entries[idx].linkedIds, newEntry.id];
-      final trimmed = updatedLinks.length > _maxLinksPerNode
-          ? updatedLinks.sublist(updatedLinks.length - _maxLinksPerNode)
-          : updatedLinks;
-      entries[idx] = entries[idx].copyWith(linkedIds: trimmed);
-    }
-
-    entries.add(newEntry);
+      linkedIds: linkedIds,
+    ));
     await _persist();
-    return newEntry.id;
+    return id;
+  }
+
+  /// Recomputes [entryId]'s neighbor links against [embedding] and keeps
+  /// the graph bidirectional: removes [entryId] from neighbors it's no
+  /// longer close enough to, adds it to new ones (respecting the same
+  /// FIFO reverse-edge cap as [add]). Returns the fresh forward link list
+  /// for [entryId] itself — the caller is responsible for actually storing
+  /// that on [entryId]'s own entry, since [entryId] may not exist in
+  /// [entries] yet (called from [add] before the new entry is inserted).
+  List<String> _relink(String entryId, List<double> embedding) {
+    final scored = <MapEntry<MemoryEntry, double>>[];
+    for (final entry in entries) {
+      if (entry.id == entryId || !entry.isActive) continue;
+      final score = _cosineSimilarity(embedding, entry.embedding);
+      if (score >= _linkThreshold) scored.add(MapEntry(entry, score));
+    }
+    scored.sort((a, b) => b.value.compareTo(a.value));
+    final newNeighborIds =
+        scored.take(_maxLinksPerNode).map((e) => e.key.id).toSet();
+
+    for (var i = 0; i < entries.length; i++) {
+      final e = entries[i];
+      if (e.id == entryId) continue;
+      final hasLink = e.linkedIds.contains(entryId);
+      final shouldLink = newNeighborIds.contains(e.id);
+      if (hasLink && !shouldLink) {
+        entries[i] =
+            e.copyWith(linkedIds: e.linkedIds.where((l) => l != entryId).toList());
+      } else if (!hasLink && shouldLink) {
+        // Cap the reverse edge too — without this, a frequently-referenced
+        // memory (e.g. "user's name") accumulates an ever-growing link
+        // list over the app's lifetime, contradicting the "small
+        // associative graph" this is meant to be. Oldest link drops first
+        // (FIFO) to make room, keeping the most recent associations.
+        final updated = [...e.linkedIds, entryId];
+        final trimmed = updated.length > _maxLinksPerNode
+            ? updated.sublist(updated.length - _maxLinksPerNode)
+            : updated;
+        entries[i] = e.copyWith(linkedIds: trimmed);
+      }
+    }
+    return newNeighborIds.toList();
   }
 
   /// Same as [add], but if a near-duplicate (cosine similarity above
@@ -174,12 +193,42 @@ class MemoryService extends GetxService {
   /// silently discarded or stored as a second copy. Saying the same thing
   /// twice should strengthen one memory, not create two.
   ///
+  /// A near-duplicate isn't always a pure repeat, though: "Au" and "I am
+  /// User and my name is AU" score as near-duplicates (same core fact,
+  /// >0.92 cosine) but the second one carries real extra detail the first
+  /// didn't. Discarding that detail just because it scored as a duplicate
+  /// would silently lose information the user explicitly asked to be
+  /// remembered. So when the new text is both meaningfully longer than
+  /// what's stored AND a superset of it (contains the old text as a
+  /// substring, case-insensitive — cheap and conservative: it guarantees
+  /// nothing in the old note is lost by the replacement, without needing
+  /// real diffing), the existing entry's text/embedding/tags are updated
+  /// in place instead of just bumping its counters — still one memory, one
+  /// id, one reinforcement, just now carrying the fuller version of the
+  /// fact. A near-duplicate that ISN'T a superset (different phrasing of a
+  /// similar-but-not-confirmed-identical fact) stays conservative and only
+  /// reinforces, since blindly overwriting there risks losing distinct
+  /// detail the old text had that the new one doesn't repeat.
+  ///
   /// Returns a record: `wasNew` is true only if a genuinely new entry was
-  /// stored (false if an existing one was reinforced instead, or nothing
-  /// happened), and `id` is that new entry's id, or the reinforced entry's
-  /// id, letting a caller (e.g. contradiction handling) reference whichever
-  /// entry actually now represents this fact.
-  Future<({bool wasNew, String? id})> addIfNotDuplicate(
+  /// stored; `wasEnriched` is true if an existing entry's text was instead
+  /// updated in place per the enrichment case above (distinct from a pure
+  /// reinforcement, so a caller can tell "content actually changed" from
+  /// "same thing said again" instead of both looking identical); `id` is
+  /// that new/updated entry's id either way, letting a caller (e.g.
+  /// contradiction handling) reference whichever entry actually now
+  /// represents this fact. Logging/toasting on the outcome is the caller's
+  /// job, not this method's, so it stays in one place rather than split
+  /// between here and every call site.
+  /// [scope], when given, restricts which existing entries can even be
+  /// considered a near-duplicate — used by memory consolidation, whose
+  /// synthesized connecting sentence is expected to score similar to the
+  /// very source memories it's summarizing (that's the point), which would
+  /// otherwise make it get silently swallowed as a "duplicate" of one of
+  /// them instead of stored as the new note it actually is. Restricting
+  /// the check to other consolidation notes still dedupes repeated sweeps
+  /// against each other without treating "summarizes X" as "is X".
+  Future<({bool wasNew, bool wasEnriched, String? id})> addIfNotDuplicate(
     String text,
     List<double> embedding, {
     String? sourceChatId,
@@ -187,28 +236,75 @@ class MemoryService extends GetxService {
     String valence = 'neutral',
     List<String> tags = const [],
     double dupThreshold = 0.92,
+    bool Function(MemoryEntry)? scope,
   }) async {
-    if (text.trim().isEmpty || embedding.isEmpty) return (wasNew: false, id: null);
+    final trimmedNew = text.trim();
+    if (trimmedNew.isEmpty || embedding.isEmpty) {
+      return (wasNew: false, wasEnriched: false, id: null);
+    }
     for (var i = 0; i < entries.length; i++) {
-      if (!entries[i].isActive) continue;
-      if (_cosineSimilarity(embedding, entries[i].embedding) >= dupThreshold) {
-        entries[i] = entries[i].copyWith(
-          accessCount: entries[i].accessCount + 1,
-          lastAccessedAt: DateTime.now(),
-        );
+      final existing = entries[i];
+      if (!existing.isActive) continue;
+      if (scope != null && !scope(existing)) continue;
+      if (_cosineSimilarity(embedding, existing.embedding) >= dupThreshold) {
+        // Word-boundary match, not a raw substring check — a short/generic
+        // existing memory (e.g. "Al") would otherwise false-positive as
+        // "contained in" any longer new text that merely happens to embed
+        // those same letters (e.g. inside "global"), silently overwriting
+        // an unrelated memory just because it scored as embedding-similar.
+        // Leading/trailing punctuation is stripped from the needle before
+        // wrapping it in \b — these distilled notes routinely end in a
+        // period, and \b can't match at a punctuation→space transition (no
+        // word/non-word boundary there), which would otherwise make a
+        // completely genuine superset match (e.g. "Name is Sarah." inside
+        // "Name is Sarah. She works in Boston.") fail to be recognized.
+        final needle =
+            existing.text.trim().replaceAll(RegExp(r'^[^\w]+|[^\w]+$'), '');
+        final isEnrichment = trimmedNew.length > existing.text.length + 8 &&
+            needle.isNotEmpty &&
+            RegExp(
+              r'\b' + RegExp.escape(needle) + r'\b',
+              caseSensitive: false,
+            ).hasMatch(trimmedNew);
+        entries[i] = isEnrichment
+            // Only the text/embedding/tags/links actually change here —
+            // category and valence are deliberately NOT overwritten from
+            // the caller's arguments. An existing entry's classification
+            // (e.g. 'instruction') is meaningful and shouldn't get
+            // silently clobbered by whatever category a later, unrelated
+            // caller (e.g. the consolidation sweep, which always passes
+            // 'summary') happens to pass just because its text scored as
+            // an enrichment of this one.
+            ? existing.copyWith(
+                text: trimmedNew,
+                embedding: embedding,
+                tags: {...existing.tags, ...tags}.toList(),
+                // The embedding just changed, possibly substantially (a
+                // bare name enriched into a full sentence) — recompute
+                // this entry's place in the associative graph rather than
+                // leaving it pointing at neighbors picked for the old,
+                // narrower embedding.
+                linkedIds: _relink(existing.id, embedding),
+                accessCount: existing.accessCount + 1,
+                lastAccessedAt: DateTime.now(),
+              )
+            : existing.copyWith(
+                accessCount: existing.accessCount + 1,
+                lastAccessedAt: DateTime.now(),
+              );
         await _persist();
-        return (wasNew: false, id: entries[i].id);
+        return (wasNew: false, wasEnriched: isEnrichment, id: entries[i].id);
       }
     }
     final newId = await add(
-      text,
+      trimmedNew,
       embedding,
       sourceChatId: sourceChatId,
       category: category,
       valence: valence,
       tags: tags,
     );
-    return (wasNew: true, id: newId);
+    return (wasNew: true, wasEnriched: false, id: newId);
   }
 
   /// Marks [oldId] as superseded by [newId] — [oldId] stays in storage and

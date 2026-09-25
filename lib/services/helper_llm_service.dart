@@ -33,6 +33,12 @@ class HelperLlmService extends GetxService {
   String get loadedModelFilename =>
       loadedModelPath.value.isEmpty ? '' : p.basename(loadedModelPath.value);
 
+  /// Whether a [complete] call is already in flight — this engine has one
+  /// generation slot, so a second caller (e.g. the periodic memory-
+  /// consolidation sweep landing mid-turn-extraction) should check this and
+  /// defer rather than call [complete] anyway and get back a silent null.
+  bool get isBusy => _isGenerating;
+
   Future<HelperLlmService> init() async => this;
 
   /// Loads [path] as the active helper model. Safe to call again with the

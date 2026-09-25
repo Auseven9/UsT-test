@@ -396,12 +396,22 @@ class LlmService extends GetxService {
   /// original (too-large) maxTokens would let history+response overrun the
   /// model's real n_ctx all over again — trimming history alone doesn't
   /// help if the response cap wasn't trimmed to match.
-  Future<({List<LlamaChatMessage> messages, int responseBudget})> fitToContext(
+  Future<({
+    List<LlamaChatMessage> messages,
+    int responseBudget,
+    int historyTokens,
+    int contextSize,
+  })> fitToContext(
     List<LlamaChatMessage> messages, {
     int reserveForResponse = 512,
   }) async {
     if (messages.isEmpty) {
-      return (messages: messages, responseBudget: reserveForResponse);
+      return (
+        messages: messages,
+        responseBudget: reserveForResponse,
+        historyTokens: 0,
+        contextSize: 0,
+      );
     }
 
     final ctx = await getContextSize();
@@ -441,7 +451,12 @@ class LlmService extends GetxService {
 
     final kept = keptReversed.reversed.toList();
     final fitted = systemMsg != null ? [systemMsg, ...kept] : kept;
-    return (messages: fitted, responseBudget: responseBudget);
+    return (
+      messages: fitted,
+      responseBudget: responseBudget,
+      historyTokens: total,
+      contextSize: ctx,
+    );
   }
 
   /// Generate a chat completion using llamadart's chat-template API.
@@ -521,6 +536,14 @@ class LlmService extends GetxService {
     r'<\|[A-Za-z_][A-Za-z0-9_]{0,24}\|?>|<[A-Za-z_][A-Za-z0-9_]{0,24}\|>',
   );
 
+  /// Whether [text] contains any leaked-control-token-looking marker — see
+  /// [_leakedControlTokenPattern]. Exposed so a caller can decide whether
+  /// text that came back in the wrong channel (e.g. native `thinking`
+  /// swallowing the real answer too, on a template llamadart mis-detects)
+  /// is worth re-splitting, without duplicating the pattern.
+  static bool containsLeakedControlTokens(String text) =>
+      _leakedControlTokenPattern.hasMatch(text);
+
   /// Best-effort safety net for a model whose chat template isn't recognized
   /// by llamadart's format detector (see [generateChatCompletion]'s doc) —
   /// NOT a real parser, just a heuristic: if any control-token-like marker
@@ -544,9 +567,24 @@ class LlmService extends GetxService {
   /// stray reserved-token tag before an otherwise complete, correct short
   /// answer — treating that case as "cut off" would hide a real answer
   /// inside the collapsed Thoughts panel instead of showing it.
+  ///
+  /// [assumeWholeTextIsAnswerIfNothingTrails] controls what happens when no
+  /// text follows the last marker at all. The original caller runs this
+  /// over `content` — text the model already emitted as its visible answer
+  /// — so if nothing trails the marker, everything before it was still
+  /// presumably real answer content with just a stray trailing tag, and
+  /// defaults to surfacing it as `answer`. A second caller runs this over
+  /// `reasoning` instead (a model whose thinking channel swallowed the real
+  /// answer too) — there, "nothing trails the last marker" means there's no
+  /// distinguishable answer to extract at all, only chain-of-thought, and
+  /// that same default would leak private analysis into the visible reply.
+  /// That caller passes `false` so this case instead behaves like the
+  /// truncated-at-the-start case above: everything stays in `reasoning`,
+  /// `answer` comes back empty.
   static ({String reasoning, String answer}) splitLeakedControlTokens(
     String text, {
     bool wasTruncated = false,
+    bool assumeWholeTextIsAnswerIfNothingTrails = true,
   }) {
     final matches = _leakedControlTokenPattern.allMatches(text).toList();
     if (matches.isEmpty) return (reasoning: '', answer: text);
@@ -559,10 +597,10 @@ class LlmService extends GetxService {
     final last = matches.last;
     final answer = text.substring(last.end).trim();
     if (answer.isEmpty) {
-      return (
-        reasoning: '',
-        answer: text.replaceAll(_leakedControlTokenPattern, '').trim(),
-      );
+      final cleaned = text.replaceAll(_leakedControlTokenPattern, '').trim();
+      return assumeWholeTextIsAnswerIfNothingTrails
+          ? (reasoning: '', answer: cleaned)
+          : (reasoning: cleaned, answer: '');
     }
     final reasoning = text
         .substring(0, last.end)

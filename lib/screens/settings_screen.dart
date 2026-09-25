@@ -1351,14 +1351,29 @@ class _PersistentMemoryCardState extends State<_PersistentMemoryCard> {
                 );
               }),
               const SizedBox(height: 16),
+              Text('Memory Extraction Instructions',
+                  style: TextStyle(color: context.text, fontSize: 14)),
+              const SizedBox(height: 4),
+              Text(
+                'What the extraction model judges as "worth remembering". '
+                'Leave blank to use the built-in default.',
+                style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+              ),
+              const SizedBox(height: 8),
+              _ExtractionGuidanceField(storage: widget.storage),
+              const SizedBox(height: 16),
               Text('Memory Health Sweep',
                   style: TextStyle(color: context.text, fontSize: 14)),
               const SizedBox(height: 4),
               Text(
-                'Periodically verifies every configured model is actually '
-                'loaded and flushes any pending memory write to disk — '
-                'surfaces a warning if something silently fell out of '
-                'memory. Set to 0 to disable.',
+                'On this interval, asks before running — a real check, not '
+                'just a flag read: verifies every configured model is '
+                'actually loaded, probes the embedding model with a real '
+                'request, and flushes any pending memory write to disk. '
+                'If everything checks out and a helper model is armed, it '
+                'also looks for connections across recent memories, which '
+                'can add a new note. Declining just skips that cycle. Set '
+                'to 0 to disable.',
                 style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
               ),
               const SizedBox(height: 8),
@@ -1443,6 +1458,103 @@ class _PersistentMemoryCardState extends State<_PersistentMemoryCard> {
         borderRadius: BorderRadius.circular(12),
       ),
       child: child,
+    );
+  }
+}
+
+/// Editable override for the memory-extraction model's "what counts as
+/// worth remembering" instructions — mirrors the Global System Prompt
+/// field's pattern (plain multi-line TextField, saved on change, a Reset
+/// action). Only the judgment-call portion is editable; the JSON-format
+/// contract that follows it in the real prompt is fixed and never shown
+/// here, since editing that away would silently break extraction parsing.
+class _ExtractionGuidanceField extends StatefulWidget {
+  final ChatStorageService storage;
+  const _ExtractionGuidanceField({required this.storage});
+
+  @override
+  State<_ExtractionGuidanceField> createState() => _ExtractionGuidanceFieldState();
+}
+
+class _ExtractionGuidanceFieldState extends State<_ExtractionGuidanceField> {
+  late final TextEditingController _controller;
+  final _focus = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.storage.memoryExtractionGuidance);
+    // Persist on focus loss rather than every keystroke — same reasoning
+    // as the custom chat template field in _HardwareSettingsCard: a Hive
+    // box write on every character typed is needless overhead on a phone
+    // for a field that's only ever read once per turn, not live-bound to
+    // anything that needs to react mid-typing.
+    _focus.addListener(() {
+      if (!_focus.hasFocus) {
+        widget.storage.memoryExtractionGuidance = _controller.text;
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _focus.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        TextField(
+          controller: _controller,
+          focusNode: _focus,
+          maxLines: 4,
+          // A long override here directly eats into the extraction
+          // prompt's token budget (see the dynamic overhead calculation in
+          // ChatController._extractAndRememberFromTurn) — capped so a
+          // pasted wall of text can't crowd out the actual exchange being
+          // extracted from.
+          maxLength: 500,
+          style: TextStyle(fontSize: 13, color: context.text, height: 1.5),
+          decoration: InputDecoration(
+            hintText: defaultMemoryExtractionGuidance,
+            hintStyle: TextStyle(color: context.textD, fontSize: 12),
+            filled: true,
+            fillColor: context.bgInput,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: BorderSide(color: context.border),
+            ),
+            enabledBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: BorderSide(color: context.border),
+            ),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: const BorderSide(color: AppColors.accent),
+            ),
+          ),
+          // Reset button's visibility tracks emptiness; the actual storage
+          // write happens on focus loss (see initState), not here.
+          onChanged: (_) => setState(() {}),
+        ),
+        if (_controller.text.isNotEmpty)
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: () {
+                setState(() => _controller.clear());
+                widget.storage.memoryExtractionGuidance = '';
+              },
+              icon: const Icon(Icons.clear_rounded, size: 16),
+              label: const Text('Reset to default'),
+              style: TextButton.styleFrom(foregroundColor: context.textD),
+            ),
+          ),
+      ],
     );
   }
 }

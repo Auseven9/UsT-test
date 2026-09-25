@@ -136,11 +136,28 @@ class ChatStorageService extends GetxService {
 
   set helperModelFilename(String value) => _settingsBox.put('helper_model', value);
 
+  /// Custom instructions for the background memory-extraction model —
+  /// what counts as "worth remembering". Empty string means use the app's
+  /// built-in default (see `defaultMemoryExtractionGuidance` at the top of
+  /// chat_controller.dart).
+  /// Deliberately just the judgment-call portion of the extraction prompt,
+  /// not the whole thing: the JSON-format instructions that follow it are
+  /// fixed and not user-editable, since the extraction parser depends on
+  /// that exact structure — letting this field replace the whole prompt
+  /// would let an edit silently break memory capture entirely.
+  String get memoryExtractionGuidance =>
+      _settingsBox.get('memory_extraction_guidance', defaultValue: '') as String;
+
+  set memoryExtractionGuidance(String value) =>
+      _settingsBox.put('memory_extraction_guidance', value);
+
   /// Minutes between periodic memory-health sweeps (flush any pending write,
-  /// re-verify each model's loaded/armed state, surface anything wrong) — 0
-  /// disables the sweep entirely. Tunable since the right cadence trades off
-  /// against battery on a phone; the sweep itself is cheap (no inference),
-  /// so a short interval is safe, just wasteful if there's nothing to check.
+  /// re-verify each model's loaded/armed state, probe the embedding model
+  /// with a real request, surface anything wrong) — 0 disables the sweep
+  /// entirely. The user is asked to confirm each cycle before it runs (see
+  /// ChatController._confirmAndRunMemorySweep), since the embedding probe
+  /// is real inference, not a free flag check — a short interval mostly
+  /// just means being asked more often, not silent background cost.
   int get memorySweepIntervalMinutes =>
       (_settingsBox.get('memory_sweep_interval_minutes', defaultValue: 10) as num)
           .toInt();

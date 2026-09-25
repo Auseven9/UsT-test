@@ -64,6 +64,11 @@ class MemoryEntry {
   bool get isActive => supersededBy == null;
 
   MemoryEntry copyWith({
+    String? text,
+    List<double>? embedding,
+    String? category,
+    String? valence,
+    List<String>? tags,
     List<String>? linkedIds,
     DateTime? lastAccessedAt,
     int? accessCount,
@@ -77,13 +82,13 @@ class MemoryEntry {
   }) {
     return MemoryEntry(
       id: id,
-      text: text,
-      embedding: embedding,
+      text: text ?? this.text,
+      embedding: embedding ?? this.embedding,
       createdAt: createdAt,
       sourceChatId: sourceChatId,
-      category: category,
-      valence: valence,
-      tags: tags,
+      category: category ?? this.category,
+      valence: valence ?? this.valence,
+      tags: tags ?? this.tags,
       linkedIds: linkedIds ?? this.linkedIds,
       lastAccessedAt: lastAccessedAt ?? this.lastAccessedAt,
       accessCount: accessCount ?? this.accessCount,

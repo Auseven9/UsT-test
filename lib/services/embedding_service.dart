@@ -76,15 +76,43 @@ class EmbeddingService extends GetxService {
     await _teardown();
   }
 
+  /// Serializes calls into the native engine — without this, two callers
+  /// requesting an embedding at the same moment (chat's own retrieval/
+  /// extraction calls racing the periodic memory-sweep probe, for instance)
+  /// would hit the same underlying llama.cpp context concurrently, which
+  /// risks a native crash or a corrupted vector rather than just one call
+  /// waiting briefly for the other.
+  Future<void> _embedChain = Future.value();
+
   /// Embeds [text], or returns null if no embedding model is loaded or the
   /// backend rejects the request (e.g. a non-embedding model was loaded).
   Future<List<double>?> embed(String text) async {
-    if (_engine == null || !isLoaded.value) return null;
-    try {
-      return await _engine!.embed(text);
-    } catch (_) {
-      return null;
-    }
+    final result = _embedChain.then((_) async {
+      if (_engine == null || !isLoaded.value) return null;
+      try {
+        // Bounds how long any ONE caller's await can hang on a stuck native
+        // call — turns "this Future never resolves" into "this Future
+        // resolves to null after 15s". It does NOT actually free up the
+        // underlying engine: llamadart runs embedding requests on a single
+        // worker isolate that processes them synchronously one at a time,
+        // and Dart's Future.timeout() can't cancel in-flight native work —
+        // so a genuinely hung native call still blocks that isolate (and
+        // therefore every later queued embed(), including chat's own
+        // retrieval/extraction calls) for as long as the hang lasts,
+        // regardless of this timeout. This is still strictly better than no
+        // timeout (no caller is left permanently unresolved), just not a
+        // full guarantee against a stuck native call taking the whole
+        // embedding pipeline down with it until the engine is reloaded.
+        return await _engine!.embed(text).timeout(const Duration(seconds: 15));
+      } catch (_) {
+        return null;
+      }
+    });
+    // Swallow here so one failed embed doesn't poison the chain for every
+    // later caller — each caller still gets its own result/error via the
+    // `result` future above.
+    _embedChain = result.catchError((_) => null);
+    return result;
   }
 
   Future<void> _teardown() async {
