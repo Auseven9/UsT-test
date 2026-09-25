@@ -12,6 +12,9 @@ import '../services/image_utils.dart';
 import '../widgets/chat_sidebar.dart';
 import '../widgets/chat_bubble.dart';
 import '../widgets/typing_indicator.dart';
+import '../widgets/tutorial_overlay.dart';
+import '../services/tutorial_service.dart';
+import '../data/tutorial_steps.dart';
 import 'model_library_screen.dart';
 import 'settings_screen.dart';
 
@@ -44,6 +47,9 @@ class _HomeScreenState extends State<HomeScreen> {
   final GlobalKey<ScaffoldState> _mobileScaffoldKey =
       GlobalKey<ScaffoldState>();
 
+  final _tutorial = Get.find<TutorialService>();
+  Worker? _tutorialTabWorker;
+
   @override
   void initState() {
     super.initState();
@@ -57,11 +63,25 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() => _attachedImageBytes = null);
       }
     });
+    // A tour step can require a specific mobile tab (e.g. Settings steps
+    // need tab 2) — the tour itself has no direct access to this screen's
+    // private tab state, so it asks via this Rx value instead.
+    _tutorialTabWorker = ever<int?>(_tutorial.requestedTab, (tab) {
+      if (tab != null && mounted) setState(() => _mobileTabIndex = tab);
+    });
+    // First launch only — later runs are explicit, via "Replay Tutorial"
+    // in Settings.
+    if (!_tutorial.hasCompletedOnboarding) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _tutorial.start(buildTutorialSteps());
+      });
+    }
   }
 
   @override
   void dispose() {
     _visionWorker?.dispose();
+    _tutorialTabWorker?.dispose();
     _scrollController.removeListener(_handleChatScroll);
     _scrollController.dispose();
     _msgController.dispose();
@@ -151,6 +171,8 @@ class _HomeScreenState extends State<HomeScreen> {
         if (isDesktop) _buildDesktopLayout() else _buildMobileLayout(),
         // ── Global model loading overlay ──
         _buildLoadingOverlay(),
+        // ── Guided tour — always on top, absorbs input while active ──
+        const TutorialOverlay(),
       ],
     );
   }
@@ -530,16 +552,21 @@ class _HomeScreenState extends State<HomeScreen> {
       child: Row(
         children: [
           // Sidebar / history button — opens drawer from left
-          IconButton(
-            icon: Icon(Icons.menu_rounded, size: 22, color: context.textM),
-            onPressed: () => _mobileScaffoldKey.currentState?.openDrawer(),
-            tooltip: 'Chat History',
+          TutorialTarget(
+            id: 'chat.history',
+            child: IconButton(
+              icon: Icon(Icons.menu_rounded, size: 22, color: context.textM),
+              onPressed: () => _mobileScaffoldKey.currentState?.openDrawer(),
+              tooltip: 'Chat History',
+            ),
           ),
 
           // Model selector dropdown
           Expanded(
             child: Center(
-              child: Obx(() {
+              child: TutorialTarget(
+                id: 'chat.model_selector',
+                child: Obx(() {
                 final fname = _modelCtrl.selectedModelFilename.value;
                 final info = fname != null
                     ? _modelCtrl.getModelInfo(fname)
@@ -595,14 +622,18 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 );
               }),
+              ),
             ),
           ),
 
           // New chat button — on the right
-          IconButton(
-            icon: Icon(Icons.edit_square, size: 20, color: context.textM),
-            onPressed: () => _chatCtrl.newChat(),
-            tooltip: 'New Chat',
+          TutorialTarget(
+            id: 'chat.new_chat',
+            child: IconButton(
+              icon: Icon(Icons.edit_square, size: 20, color: context.textM),
+              onPressed: () => _chatCtrl.newChat(),
+              tooltip: 'New Chat',
+            ),
           ),
         ],
       ),
@@ -1086,7 +1117,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildInputArea() {
-    return Container(
+    return TutorialTarget(
+      id: 'chat.input',
+      child: Container(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1177,6 +1210,7 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
           ),
         ],
+      ),
       ),
     );
   }

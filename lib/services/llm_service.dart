@@ -26,6 +26,18 @@ class GenerationChunk {
   const GenerationChunk({this.content = '', this.thinking = '', this.toolCalls});
 }
 
+/// One backend's real measured result from [LlmService.benchmarkBackends] —
+/// either a genuine tokens/sec figure from an actual timed generation, or
+/// an error if that backend failed to load or generate on this device.
+class BackendBenchmarkResult {
+  final String backend;
+  final double? tokensPerSecond;
+  final String? error;
+  const BackendBenchmarkResult({required this.backend, this.tokensPerSecond, this.error});
+
+  bool get succeeded => tokensPerSecond != null;
+}
+
 /// Wraps llamadart's LlamaEngine for model loading, generation, and lifecycle.
 class LlmService extends GetxService {
   LlamaEngine? _engine;
@@ -648,6 +660,37 @@ class LlmService extends GetxService {
     }
   }
 
+  /// Real, static enumeration of the backends the native library actually
+  /// has compiled in and registered on this device (e.g. "CPU, Vulkan") —
+  /// independent of which one is currently configured. Empty string if
+  /// unavailable (no model loaded, or the backend can't report it).
+  Future<String> getAvailableBackends() async {
+    if (_engine == null || !isLoaded.value) return '';
+    try {
+      return await _engine!.getAvailableBackends();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /// Real per-token confidence from the just-finished generation — how
+  /// much probability mass the model's raw output distribution put on
+  /// each sampled token, relative to that step's own top choice, averaged
+  /// across the response. 1.0 means every token was the model's own
+  /// argmax; lower means sampling diverged from it. Not a calibrated
+  /// probability of correctness — only how much the sampler moved away
+  /// from the model's mode. Null if unavailable (older llamadart without
+  /// this field, no model loaded, or nothing was generated yet).
+  Future<double?> getResponseConfidence() async {
+    if (_engine == null || !isLoaded.value) return null;
+    try {
+      final perf = await _engine!.getPerformanceContext();
+      return perf?.responseConfidence;
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<int> countTokens(String text) async {
     if (_engine == null || !isLoaded.value) return 0;
     try {
@@ -663,6 +706,80 @@ class LlmService extends GetxService {
     _generateSub = null;
     _engine?.cancelGeneration();
     isGenerating.value = false;
+  }
+
+  /// Reloads the currently loaded model once per entry in [backends],
+  /// measures real tokens/sec on a short fixed prompt for each, and
+  /// restores the original backend/gpuLayers/loaded state before
+  /// returning — win or lose, this never leaves the app in a different
+  /// config than it started in. [testGpuLayers] is a coarse probe value
+  /// (matches the 33 used elsewhere as the default when switching to a GPU
+  /// backend), not a tuned optimum for the loaded model's actual layer
+  /// count; llama.cpp clamps an over-request to what the model has.
+  ///
+  /// This exists because a guessed GPU recommendation (OpenCL, from core
+  /// count alone) previously measured ~1 token/sec on real hardware —
+  /// dramatically worse than CPU. The only trustworthy answer to "should
+  /// this device use GPU" is a real measurement on this exact device, not
+  /// another heuristic.
+  Future<List<BackendBenchmarkResult>> benchmarkBackends({
+    List<String> backends = const ['cpu', 'vulkan', 'opencl'],
+    int testGpuLayers = 33,
+    void Function(String backend)? onProgress,
+  }) async {
+    final storage = Get.find<ChatStorageService>();
+    final originalPath = loadedModelPath.value;
+    final originalBackend = storage.backendType;
+    final originalGpuLayers = storage.gpuLayers;
+    if (originalPath.isEmpty || !isLoaded.value) {
+      throw StateError('Load a model before benchmarking backends.');
+    }
+
+    const testPrompt = 'Write one short sentence about the ocean.';
+    const testMaxTokens = 32;
+    final results = <BackendBenchmarkResult>[];
+
+    for (final backend in backends) {
+      onProgress?.call(backend);
+      try {
+        storage.backendType = backend;
+        storage.gpuLayers = backend == 'cpu' ? 0 : testGpuLayers;
+        await loadModel(originalPath);
+        if (!isLoaded.value) {
+          results.add(BackendBenchmarkResult(backend: backend, error: 'Failed to load.'));
+          continue;
+        }
+        final stream = generateChatCompletion(
+          messages: [LlamaChatMessage.fromText(role: LlamaChatRole.user, text: testPrompt)],
+          params: const GenerationParams(temp: 0.2, maxTokens: testMaxTokens),
+          enableThinking: false,
+        );
+        await for (final _ in stream) {
+          // Draining is the point — the real measurement is
+          // lastGenerationSpeed once the stream finishes.
+        }
+        results.add(BackendBenchmarkResult(
+          backend: backend,
+          tokensPerSecond: lastGenerationSpeed.value,
+        ));
+      } catch (e) {
+        results.add(BackendBenchmarkResult(backend: backend, error: e.toString()));
+      }
+    }
+
+    // Restore the original configuration regardless of what happened
+    // above — benchmarking must never be the reason the app ends up on a
+    // different backend than the user actually chose.
+    storage.backendType = originalBackend;
+    storage.gpuLayers = originalGpuLayers;
+    try {
+      await loadModel(originalPath);
+    } catch (_) {
+      // Best-effort restore — a failure here surfaces through isLoaded
+      // being false, same as any other load failure would.
+    }
+
+    return results;
   }
 
   /// Full native teardown — dispose engine AND backend to prevent stale state.

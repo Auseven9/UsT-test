@@ -12,6 +12,8 @@ import '../services/log_service.dart';
 import '../services/embedding_service.dart';
 import '../services/helper_llm_service.dart';
 import '../services/memory_service.dart';
+import '../services/reasoning_trace_service.dart';
+import '../services/reminder_service.dart';
 import '../services/background_optimizer_service.dart';
 import '../routes/app_routes.dart';
 
@@ -64,6 +66,8 @@ class _SplashScreenState extends State<SplashScreen> {
       final memory = await Get.find<MemoryService>().init();
       final embedding = await Get.find<EmbeddingService>().init();
       final helper = await Get.find<HelperLlmService>().init();
+      await Get.find<ReasoningTraceService>().init();
+      await Get.find<ReminderService>().init();
       log.info('${memory.entries.length} memories loaded', source: 'Splash');
 
       // Restore the last-loaded chat model across restarts. Without this the

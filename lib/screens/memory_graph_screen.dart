@@ -102,6 +102,12 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
   bool _computingLayout = false;
   String? _selectedId;
 
+  /// When true, tapping nodes links/unlinks them (see [_handleTap]) instead
+  /// of opening the detail sheet. [_linkAnchorId] holds the first node
+  /// tapped while in this mode, waiting for a second.
+  bool _linkMode = false;
+  String? _linkAnchorId;
+
   /// Fire-and-forget: kicks off the layout computation on a background
   /// isolate (see [_computeGraphLayout]) if the entry set actually
   /// changed and nothing is already computing. Safe to call from inside
@@ -164,11 +170,54 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
         closestId = e.id;
       }
     }
-    setState(() => _selectedId = closestId);
-    if (closestId != null) {
-      final entry = entries.firstWhere((e) => e.id == closestId);
-      _showEntrySheet(entry);
+    if (closestId == null) {
+      // Tapping empty canvas outside link mode clears the current
+      // highlight — restored here since link mode's early-return for a
+      // miss shouldn't also swallow this for ordinary node selection.
+      if (!_linkMode && _selectedId != null) setState(() => _selectedId = null);
+      return;
     }
+
+    if (_linkMode) {
+      if (_linkAnchorId == null) {
+        setState(() => _linkAnchorId = closestId);
+        return;
+      }
+      if (_linkAnchorId == closestId) {
+        setState(() => _linkAnchorId = null); // tapped anchor again — cancel
+        return;
+      }
+      MemoryEntry? anchor;
+      for (final e in entries) {
+        if (e.id == _linkAnchorId) {
+          anchor = e;
+          break;
+        }
+      }
+      if (anchor == null) {
+        // The anchor was deleted (e.g. by working-memory maintenance)
+        // between the first tap and this second one — nothing to link.
+        setState(() => _linkAnchorId = null);
+        return;
+      }
+      final alreadyLinked = anchor.linkedIds.contains(closestId);
+      final memory = Get.find<MemoryService>();
+      if (alreadyLinked) {
+        memory.unlinkManually(anchor.id, closestId);
+        Get.snackbar('Unlinked', 'Removed the manual link.',
+            snackPosition: SnackPosition.BOTTOM, duration: const Duration(seconds: 2));
+      } else {
+        memory.linkManually(anchor.id, closestId);
+        Get.snackbar('Linked', 'Connected the two memories.',
+            snackPosition: SnackPosition.BOTTOM, duration: const Duration(seconds: 2));
+      }
+      setState(() => _linkAnchorId = null);
+      return;
+    }
+
+    setState(() => _selectedId = closestId);
+    final entry = entries.firstWhere((e) => e.id == closestId);
+    _showEntrySheet(entry);
   }
 
   double _nodeRadius(MemoryEntry e) => 7.0 + sqrt(e.accessCount.toDouble()) * 3.0;
@@ -269,10 +318,37 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
                     'Memory Graph',
                     style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600, color: context.text),
                   ),
+                  const Spacer(),
+                  IconButton(
+                    icon: Icon(
+                      _linkMode ? Icons.link_rounded : Icons.link_outlined,
+                      size: 20,
+                      color: _linkMode ? AppColors.accent : context.textD,
+                    ),
+                    tooltip: _linkMode ? 'Exit link mode' : 'Manually link/unlink memories',
+                    onPressed: () => setState(() {
+                      _linkMode = !_linkMode;
+                      _linkAnchorId = null;
+                    }),
+                  ),
+                  const SizedBox(width: 4),
                 ],
               ),
             ),
           ),
+          if (_linkMode)
+            Container(
+              width: double.infinity,
+              color: AppColors.accent.withValues(alpha: 0.12),
+              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+              child: Text(
+                _linkAnchorId == null
+                    ? 'Tap a memory, then tap a second one to link or unlink them.'
+                    : 'Now tap the second memory. Tap the first one again to cancel.',
+                style: TextStyle(fontSize: 12, color: context.text),
+                textAlign: TextAlign.center,
+              ),
+            ),
           Expanded(
             child: Obx(() {
               final entries = memory.entries.toList();
@@ -298,7 +374,10 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
                       painter: _GraphPainter(
                         entries: entries,
                         positions: _positions,
-                        selectedId: _selectedId,
+                        // The highlight ring doubles as the link-mode
+                        // anchor indicator — same visual, different meaning
+                        // depending on mode, so no extra painter logic.
+                        selectedId: _linkMode ? _linkAnchorId : _selectedId,
                         categoryColor: _categoryColor,
                         nodeRadius: _nodeRadius,
                         isDark: context.isDark,

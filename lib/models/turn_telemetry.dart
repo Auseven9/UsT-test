@@ -49,6 +49,28 @@ class TurnTelemetry extends ChangeNotifier {
   String? extractedCategory;
   String? extractedValence;
 
+  /// 0.0 (confident) to 1.0 (uncertain), set once generation finishes.
+  /// When [uncertaintyIsHeuristic] is false, this is a real measurement —
+  /// 1.0 minus the engine's own average per-token confidence (how much
+  /// probability mass the model put on the tokens it actually sampled).
+  /// When true, it's a fallback: surface-language hedge-word density from
+  /// [UncertaintyHeuristics.hedgeScore], used only when the engine can't
+  /// report the real signal (older llamadart, no model loaded).
+  double? uncertainty;
+
+  /// Whether [uncertainty] is the surface-language fallback rather than a
+  /// real per-token confidence measurement — see [uncertainty]'s own doc.
+  bool uncertaintyIsHeuristic = false;
+
+  /// Whether the self-critique pass (a bounded second generation — see
+  /// ChatController._runSelfCritique) flagged a possible issue with this
+  /// answer, and its note if so. Null means the pass never ran (no helper
+  /// or main model available, or the feature is toggled off), not "ran and
+  /// found nothing" — see [critiqueRan] for that distinction.
+  bool critiqueRan = false;
+  bool? critiqueFlagged;
+  String? critiqueNote;
+
   void addCadenceSample(bool isThinking, double intervalMs) {
     cadence.add(CadenceSample(isThinking: isThinking, intervalMs: intervalMs));
     if (cadence.length > _maxCadenceSamples) cadence.removeAt(0);
@@ -74,6 +96,19 @@ class TurnTelemetry extends ChangeNotifier {
   void setExtractedValence(String category, String valence) {
     extractedCategory = category;
     extractedValence = valence;
+    notifyListeners();
+  }
+
+  void setUncertainty(double value, {required bool isHeuristic}) {
+    uncertainty = value;
+    uncertaintyIsHeuristic = isHeuristic;
+    notifyListeners();
+  }
+
+  void setCritique({required bool flagged, String? note}) {
+    critiqueRan = true;
+    critiqueFlagged = flagged;
+    critiqueNote = note;
     notifyListeners();
   }
 

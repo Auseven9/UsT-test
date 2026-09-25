@@ -11,7 +11,19 @@ dependencies:
     sdk: flutter
 
   # ── LLM Engine ──────────────────────────────────────────────────
-  llamadart: ^0.6.10
+  # Was pub.dev ^0.8.24 (bumped from 0.6.10 for the public speculative-
+  # decoding API — n-gram self-speculative strategies need no second
+  # model at all, plus real draft-model strategies). Now pinned to a git
+  # branch on our own fork instead: that branch adds real per-token
+  # confidence (responseConfidence) and best-of-N branch preview
+  # generation on top of the same 0.8.24 base — neither exists upstream
+  # yet. This means the app no longer auto-tracks pub.dev's llamadart
+  # releases; pulling a newer pub.dev release back in means rebasing the
+  # fork branch on it first.
+  llamadart:
+    git:
+      url: https://github.com/Auseven9/llamadart
+      ref: feature/response-confidence-and-best-of-n
 
   # ── State Management ────────────────────────────────────────────
   get: ^4.7.2                      # GetX - controllers, routing, state

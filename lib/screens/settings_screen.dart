@@ -14,6 +14,10 @@ import '../services/chat_storage_service.dart';
 import '../services/embedding_service.dart';
 import '../services/helper_llm_service.dart';
 import '../services/memory_service.dart';
+import '../services/reminder_service.dart';
+import '../services/tutorial_service.dart';
+import '../data/tutorial_steps.dart';
+import '../widgets/tutorial_overlay.dart';
 import '../services/crash_log_service.dart';
 import '../services/llm_service.dart';
 import '../routes/app_routes.dart';
@@ -51,6 +55,7 @@ class _SettingsBody extends StatelessWidget {
     final memory = Get.find<MemoryService>();
     final embedding = Get.find<EmbeddingService>();
     final helper = Get.find<HelperLlmService>();
+    final reminders = Get.find<ReminderService>();
 
     return Column(
       children: [
@@ -95,6 +100,59 @@ class _SettingsBody extends StatelessWidget {
           child: ListView(
             padding: const EdgeInsets.all(20),
             children: [
+              // ── Help ─────────────────────────────────────
+              _sectionHeader(context, 'Help'),
+              const SizedBox(height: 8),
+              _card(
+                context,
+                child: ListTile(
+                  leading: Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: AppColors.accent.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Icon(Icons.school_outlined,
+                        size: 18, color: AppColors.accent),
+                  ),
+                  title: Text(
+                    'Replay Tutorial',
+                    style: TextStyle(color: context.text, fontSize: 14),
+                  ),
+                  subtitle: Text(
+                    'Walks through the message box, model selector, and '
+                    'every adjustable setting again, with what each one '
+                    'actually does.',
+                    style: TextStyle(color: context.textD, fontSize: 12),
+                  ),
+                  trailing: Icon(Icons.arrow_forward_ios_rounded,
+                      size: 14, color: context.textD),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 4,
+                  ),
+                  onTap: () {
+                    // Settings is already tab 2 — jump back to Chat (tab 0)
+                    // first so the tour's own first few steps (message
+                    // box, model selector) have something to spotlight,
+                    // same as a first-run start. Reset to null first: an
+                    // Rx setter that assigns the SAME value it already
+                    // holds doesn't notify listeners, and requestedTab can
+                    // easily already be 0 here (e.g. never touched since
+                    // app launch) even though the visible tab is Settings
+                    // — going null-then-0 forces the change through
+                    // regardless of whatever it was before.
+                    final tutorial = Get.find<TutorialService>();
+                    tutorial.requestedTab.value = null;
+                    tutorial.requestedTab.value = 0;
+                    tutorial.replay(buildTutorialSteps());
+                  },
+                ),
+              ),
+
+              const SizedBox(height: 28),
+
               // ── Appearance ────────────────────────────────
               _sectionHeader(context, 'Appearance'),
               const SizedBox(height: 12),
@@ -169,14 +227,22 @@ class _SettingsBody extends StatelessWidget {
               const SizedBox(height: 28),
 
               // ── System Prompt ─────────────────────────────
-              _sectionHeader(context, 'Global System Prompt'),
+              Row(
+                children: [
+                  _sectionHeader(context, 'Global System Prompt'),
+                  const SizedBox(width: 8),
+                  const ModelInjectionBadge(),
+                ],
+              ),
               const SizedBox(height: 8),
               Text(
                 'Applied to all new chats. Existing chats keep their own prompt.',
                 style: TextStyle(fontSize: 12, color: context.textD),
               ),
               const SizedBox(height: 12),
-              Obx(
+              TutorialTarget(
+                id: 'settings.system_prompt',
+                child: Obx(
                 () => TextField(
                   controller:
                       TextEditingController(text: chatCtrl.systemPrompt.value)
@@ -212,6 +278,7 @@ class _SettingsBody extends StatelessWidget {
                   onChanged: (v) => chatCtrl.setGlobalSystemPrompt(v),
                 ),
               ),
+              ),
               const SizedBox(height: 8),
               Align(
                 alignment: Alignment.centerLeft,
@@ -238,7 +305,9 @@ class _SettingsBody extends StatelessWidget {
               // ── Temperature ───────────────────────────────
               _sectionHeader(context, 'Temperature'),
               const SizedBox(height: 12),
-              _card(
+              TutorialTarget(
+                id: 'settings.temperature',
+                child: _card(
                 context,
                 child: Obx(
                   () => Padding(
@@ -284,6 +353,7 @@ class _SettingsBody extends StatelessWidget {
                   ),
                 ),
               ),
+              ),
 
               const SizedBox(height: 28),
 
@@ -297,12 +367,21 @@ class _SettingsBody extends StatelessWidget {
               // ── Hardware Configuration ──────────────────────────
               _sectionHeader(context, 'Hardware Configuration'),
               const SizedBox(height: 8),
-              _HardwareSettingsCard(storage: storage),
+              TutorialTarget(
+                id: 'settings.hardware',
+                child: _HardwareSettingsCard(storage: storage),
+              ),
 
               const SizedBox(height: 28),
 
               // ── Persistent Memory ──────────────────────────
-              _sectionHeader(context, 'Persistent Memory'),
+              Row(
+                children: [
+                  _sectionHeader(context, 'Persistent Memory'),
+                  const SizedBox(width: 8),
+                  const ModelInjectionBadge(),
+                ],
+              ),
               const SizedBox(height: 8),
               Text(
                 'Distills conversations into short notes that can surface again '
@@ -311,11 +390,31 @@ class _SettingsBody extends StatelessWidget {
                 style: TextStyle(fontSize: 12, color: context.textD),
               ),
               const SizedBox(height: 12),
-              _PersistentMemoryCard(
-                storage: storage,
-                memory: memory,
-                embedding: embedding,
-                helper: helper,
+              TutorialTarget(
+                id: 'settings.persistent_memory',
+                child: _PersistentMemoryCard(
+                  storage: storage,
+                  memory: memory,
+                  embedding: embedding,
+                  helper: helper,
+                ),
+              ),
+
+              const SizedBox(height: 28),
+
+              // ── Reminders ──────────────────────────────────
+              _sectionHeader(context, 'Reminders'),
+              const SizedBox(height: 8),
+              Text(
+                'Set via the model\'s set_reminder tool (Advanced Tools). '
+                'Surfaced in-app when due — not a phone notification, only '
+                'while the app is open.',
+                style: TextStyle(fontSize: 12, color: context.textD),
+              ),
+              const SizedBox(height: 12),
+              TutorialTarget(
+                id: 'settings.reminders',
+                child: _RemindersCard(reminders: reminders),
               ),
 
               const SizedBox(height: 28),
@@ -328,7 +427,9 @@ class _SettingsBody extends StatelessWidget {
                 style: TextStyle(fontSize: 12, color: context.textD),
               ),
               const SizedBox(height: 12),
-              _card(
+              TutorialTarget(
+                id: 'settings.local_api_server',
+                child: _card(
                 context,
                 child: Obx(() {
                   final running = apiServer.isRunning.value;
@@ -565,6 +666,7 @@ class _SettingsBody extends StatelessWidget {
                     ),
                   );
                 }),
+              ),
               ),
 
               const SizedBox(height: 28),
@@ -877,6 +979,10 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
   late double _repeatPenalty;
   late bool _enableThinking;
   late bool _toolsEnabled;
+  late bool _advancedToolsEnabled;
+  late bool _selfCritiqueEnabled;
+  late bool _reasoningTraceEnabled;
+  late bool _speculativeDecodingEnabled;
   late TextEditingController _customTemplateController;
   final _customTemplateFocus = FocusNode();
   bool _showAdvanced = false;
@@ -891,6 +997,10 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
     _repeatPenalty = widget.storage.repeatPenalty;
     _enableThinking = widget.storage.enableModelThinking;
     _toolsEnabled = widget.storage.toolsEnabled;
+    _advancedToolsEnabled = widget.storage.advancedToolsEnabled;
+    _selfCritiqueEnabled = widget.storage.selfCritiqueEnabled;
+    _reasoningTraceEnabled = widget.storage.reasoningTraceEnabled;
+    _speculativeDecodingEnabled = widget.storage.speculativeDecodingEnabled;
     _customTemplateController =
         TextEditingController(text: widget.storage.customChatTemplate);
     // Persist on focus loss rather than every keystroke (same reasoning as
@@ -944,6 +1054,11 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // ── Context size ──
+          TutorialTarget(
+            id: 'settings.context_size',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -983,11 +1098,16 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
             onChanged: (v) => setState(() => _contextSize = v.round()),
             onChangeEnd: (v) => widget.storage.contextSize = v.round(),
           ),
+              ],
+            ),
+          ),
 
           const SizedBox(height: 8),
 
           // ── Model thinking toggle ──
-          SwitchListTile(
+          TutorialTarget(
+            id: 'settings.model_reasoning',
+            child: SwitchListTile(
             title: Text('Model Reasoning',
                 style: TextStyle(color: context.text, fontSize: 14)),
             subtitle: Text(
@@ -1003,17 +1123,30 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
             activeThumbColor: AppColors.accent,
             contentPadding: EdgeInsets.zero,
           ),
+          ),
 
           const SizedBox(height: 8),
 
           // ── Tool calling toggle ──
-          SwitchListTile(
-            title: Text('Tool Calling',
-                style: TextStyle(color: context.text, fontSize: 14)),
+          TutorialTarget(
+            id: 'settings.tool_calling',
+            child: SwitchListTile(
+            title: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('Tool Calling',
+                    style: TextStyle(color: context.text, fontSize: 14)),
+                const SizedBox(width: 8),
+                const ModelInjectionBadge(),
+              ],
+            ),
             subtitle: Text(
               'Give the model access to a few offline tools: current date/'
-              'time, a calculator, and read-only memory search. Adds some '
-              'prompt overhead to every turn even when unused.',
+              'time, a calculator, and memory search. With Persistent '
+              'Memory also on, this includes memory write tools — the '
+              'model can save, edit, or supersede memories on its own, '
+              'not just read them. Adds some prompt overhead to every '
+              'turn even when unused.',
               style: TextStyle(color: context.textD, fontSize: 11),
             ),
             value: _toolsEnabled,
@@ -1023,6 +1156,116 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
             },
             activeThumbColor: AppColors.accent,
             contentPadding: EdgeInsets.zero,
+          ),
+          ),
+
+          const SizedBox(height: 8),
+
+          // ── Advanced tools toggle ──
+          TutorialTarget(
+            id: 'settings.advanced_tools',
+            child: SwitchListTile(
+            title: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('Advanced Tools',
+                    style: TextStyle(color: context.text, fontSize: 14)),
+                const SizedBox(width: 8),
+                const ModelInjectionBadge(),
+              ],
+            ),
+            subtitle: Text(
+              'Clipboard read/write, in-app reminders, and recalling its own '
+              'past reasoning. All on-device, no network. Requires Tool '
+              'Calling above to be on.',
+              style: TextStyle(color: context.textD, fontSize: 11),
+            ),
+            value: _advancedToolsEnabled,
+            onChanged: (v) {
+              setState(() => _advancedToolsEnabled = v);
+              widget.storage.advancedToolsEnabled = v;
+            },
+            activeThumbColor: AppColors.accent,
+            contentPadding: EdgeInsets.zero,
+          ),
+          ),
+
+          const SizedBox(height: 8),
+
+          // ── Self-critique toggle ──
+          TutorialTarget(
+            id: 'settings.self_critique',
+            child: SwitchListTile(
+            title: Text('Self-Critique',
+                style: TextStyle(color: context.text, fontSize: 14)),
+            subtitle: Text(
+              'After each reply, a short background check (helper model if '
+              'armed, otherwise the main model) looks for contradictions '
+              'with memory or unsupported confident claims. Never edits or '
+              'blocks the reply — just a soft note if it finds something. '
+              'Costs one extra background generation per turn.',
+              style: TextStyle(color: context.textD, fontSize: 11),
+            ),
+            value: _selfCritiqueEnabled,
+            onChanged: (v) {
+              setState(() => _selfCritiqueEnabled = v);
+              widget.storage.selfCritiqueEnabled = v;
+            },
+            activeThumbColor: AppColors.accent,
+            contentPadding: EdgeInsets.zero,
+          ),
+          ),
+
+          const SizedBox(height: 8),
+
+          // ── Reasoning trace toggle ──
+          TutorialTarget(
+            id: 'settings.reasoning_trace',
+            child: SwitchListTile(
+            title: Text('Reasoning Trace',
+                style: TextStyle(color: context.text, fontSize: 14)),
+            subtitle: Text(
+              'Distill each turn\'s chain-of-thought into a short gist and '
+              'keep it in its own lane, separate from fact memory, so the '
+              'model can recall how it approached something before — not '
+              'just what it concluded.',
+              style: TextStyle(color: context.textD, fontSize: 11),
+            ),
+            value: _reasoningTraceEnabled,
+            onChanged: (v) {
+              setState(() => _reasoningTraceEnabled = v);
+              widget.storage.reasoningTraceEnabled = v;
+            },
+            activeThumbColor: AppColors.accent,
+            contentPadding: EdgeInsets.zero,
+          ),
+          ),
+
+          const SizedBox(height: 8),
+
+          // ── Speculative decoding toggle ──
+          TutorialTarget(
+            id: 'settings.speculative_decoding',
+            child: SwitchListTile(
+            title: Text('Speculative Decoding',
+                style: TextStyle(color: context.text, fontSize: 14)),
+            subtitle: Text(
+              'n-gram self-speculative decoding — drafts from tokens '
+              'already in the conversation and verifies them in one batch. '
+              'Never changes what gets generated, only how fast, at least '
+              'in theory — this app has no on-device measurement of it '
+              'yet, so it starts off. Worth trying and watching your '
+              'tokens/sec before and after.',
+              style: TextStyle(color: context.textD, fontSize: 11),
+            ),
+            value: _speculativeDecodingEnabled,
+            onChanged: (v) {
+              setState(() => _speculativeDecodingEnabled = v);
+              widget.storage.speculativeDecodingEnabled = v;
+            },
+            activeThumbColor: AppColors.accent,
+            contentPadding: EdgeInsets.zero,
+          ),
           ),
 
           const SizedBox(height: 8),
@@ -1202,6 +1445,163 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
   }
 }
 
+/// Real measured results from LlmService.benchmarkBackends — ranked
+/// fastest first, each with a one-tap "Use This" that only appears for
+/// backends that actually completed a generation (a failed/errored
+/// backend has nothing to apply).
+class _BenchmarkResultsList extends StatelessWidget {
+  final List<BackendBenchmarkResult> results;
+  final void Function(BackendBenchmarkResult) onApply;
+  final String Function(String) backendLabel;
+
+  const _BenchmarkResultsList({
+    required this.results,
+    required this.onApply,
+    required this.backendLabel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final ranked = results.toList()
+      ..sort((a, b) {
+        if (a.succeeded && !b.succeeded) return -1;
+        if (!a.succeeded && b.succeeded) return 1;
+        if (!a.succeeded && !b.succeeded) return 0;
+        return b.tokensPerSecond!.compareTo(a.tokensPerSecond!);
+      });
+    final fastest = ranked.isNotEmpty && ranked.first.succeeded ? ranked.first : null;
+
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: context.bgHover.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: context.borderFaint),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (final r in ranked)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(
+                children: [
+                  Icon(
+                    r.succeeded ? Icons.check_circle_outline_rounded : Icons.error_outline_rounded,
+                    size: 14,
+                    color: r == fastest
+                        ? AppColors.green
+                        : r.succeeded
+                            ? context.textM
+                            : AppColors.red,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      backendLabel(r.backend),
+                      style: TextStyle(
+                        color: context.text,
+                        fontSize: 13,
+                        fontWeight: r == fastest ? FontWeight.w700 : FontWeight.normal,
+                      ),
+                    ),
+                  ),
+                  Text(
+                    r.succeeded
+                        ? '${r.tokensPerSecond!.toStringAsFixed(1)} t/s'
+                        : 'failed',
+                    style: TextStyle(
+                      color: r.succeeded ? context.textM : AppColors.red,
+                      fontSize: 12,
+                    ),
+                  ),
+                  if (r.succeeded) ...[
+                    const SizedBox(width: 8),
+                    TextButton(
+                      onPressed: () => onApply(r),
+                      style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      child: const Text('Use This', style: TextStyle(fontSize: 11)),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RemindersCard extends StatelessWidget {
+  final ReminderService reminders;
+
+  const _RemindersCard({required this.reminders});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: context.bgPanel,
+        border: Border.all(color: context.border),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Obx(() {
+        final all = reminders.reminders.toList()
+          ..sort((a, b) => a.dueAt.compareTo(b.dueAt));
+        if (all.isEmpty) {
+          return Padding(
+            padding: const EdgeInsets.all(16),
+            child: Text(
+              'No reminders set.',
+              style: TextStyle(color: context.textD, fontSize: 12),
+            ),
+          );
+        }
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final r in all)
+              ListTile(
+                dense: true,
+                title: Text(r.text, style: TextStyle(color: context.text, fontSize: 13)),
+                subtitle: Text(
+                  r.fired
+                      ? 'Due ${_formatDueAt(r.dueAt)} — already surfaced'
+                      : 'Due ${_formatDueAt(r.dueAt)}',
+                  style: TextStyle(color: context.textD, fontSize: 11),
+                ),
+                trailing: IconButton(
+                  icon: Icon(Icons.close_rounded, size: 18, color: context.textD),
+                  tooltip: 'Dismiss',
+                  onPressed: () => reminders.dismiss(r.id),
+                ),
+              ),
+          ],
+        );
+      }),
+    );
+  }
+
+  String _formatDueAt(DateTime dueAt) {
+    final now = DateTime.now();
+    final diff = dueAt.difference(now);
+    if (diff.inMinutes.abs() < 1) return 'now';
+    if (diff.isNegative) {
+      final ago = -diff;
+      if (ago.inDays > 0) return '${ago.inDays}d ago';
+      if (ago.inHours > 0) return '${ago.inHours}h ago';
+      return '${ago.inMinutes}m ago';
+    }
+    if (diff.inDays > 0) return 'in ${diff.inDays}d';
+    if (diff.inHours > 0) return 'in ${diff.inHours}h';
+    return 'in ${diff.inMinutes}m';
+  }
+}
+
 class _PersistentMemoryCard extends StatefulWidget {
   final ChatStorageService storage;
   final MemoryService memory;
@@ -1362,6 +1762,27 @@ class _PersistentMemoryCardState extends State<_PersistentMemoryCard> {
               const SizedBox(height: 8),
               _ExtractionGuidanceField(storage: widget.storage),
               const SizedBox(height: 16),
+              TutorialTarget(
+                id: 'settings.memory_verification',
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+              Text('Memory Verification', style: TextStyle(color: context.text, fontSize: 14)),
+              const SizedBox(height: 4),
+              Text(
+                'Runs 5 fixed test exchanges through the real extraction '
+                'pipeline (using whatever model is currently armed) and '
+                'checks the results against known-correct answers — '
+                'including one negative case that should capture nothing. '
+                'Nothing here is written to memory.',
+                style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+              ),
+              const SizedBox(height: 8),
+              const _MemoryVerificationButton(),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
               Text('Memory Health Sweep',
                   style: TextStyle(color: context.text, fontSize: 14)),
               const SizedBox(height: 4),
@@ -1468,6 +1889,110 @@ class _PersistentMemoryCardState extends State<_PersistentMemoryCard> {
 /// action). Only the judgment-call portion is editable; the JSON-format
 /// contract that follows it in the real prompt is fixed and never shown
 /// here, since editing that away would silently break extraction parsing.
+/// Runs [ChatController.runMemoryVerificationSuite] on demand and shows the
+/// result — pass/fail count plus per-case detail — in a dialog. A real
+/// generation per test case, so this can take a while on slow hardware;
+/// the button disables itself and shows a spinner while running rather
+/// than allowing overlapping runs.
+class _MemoryVerificationButton extends StatefulWidget {
+  const _MemoryVerificationButton();
+
+  @override
+  State<_MemoryVerificationButton> createState() => _MemoryVerificationButtonState();
+}
+
+class _MemoryVerificationButtonState extends State<_MemoryVerificationButton> {
+  bool _running = false;
+
+  Future<void> _run() async {
+    setState(() => _running = true);
+    try {
+      final result = await Get.find<ChatController>().runMemoryVerificationSuite();
+      if (!mounted) return;
+      showDialog(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          backgroundColor: dialogContext.bgPanel,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Text(
+            '${result.passed}/${result.total} passed',
+            style: TextStyle(color: dialogContext.text),
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  for (final d in result.details)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 6),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Icon(
+                            d.passed ? Icons.check_circle : Icons.cancel,
+                            size: 16,
+                            color: d.passed ? AppColors.green : AppColors.red,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(d.description,
+                                    style: TextStyle(fontSize: 13, color: dialogContext.text)),
+                                Text('Got: "${d.actual}"',
+                                    style: TextStyle(fontSize: 11, color: dialogContext.textD)),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: Text('Close', style: TextStyle(color: dialogContext.textD)),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _running = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: double.infinity,
+      child: OutlinedButton.icon(
+        onPressed: _running ? null : _run,
+        icon: _running
+            ? const SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.fact_check_outlined, size: 18),
+        label: Text(_running ? 'Running…' : 'Run Verification'),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: context.text,
+          side: BorderSide(color: context.border),
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        ),
+      ),
+    );
+  }
+}
+
 class _ExtractionGuidanceField extends StatefulWidget {
   final ChatStorageService storage;
   const _ExtractionGuidanceField({required this.storage});
@@ -1625,6 +2150,11 @@ class _HardwareSettingsCardState extends State<_HardwareSettingsCard> {
   late double _gpuLayers;
   bool _showManual = false;
 
+  List<String>? _detectedBackends;
+  bool _benchmarking = false;
+  String? _benchmarkingCurrent;
+  List<BackendBenchmarkResult>? _benchmarkResults;
+
   // Recommended backend for this device.
   //
   // This used to guess GPU (OpenCL, 33 layers) for any 8+ core Android
@@ -1654,6 +2184,140 @@ class _HardwareSettingsCardState extends State<_HardwareSettingsCard> {
     super.initState();
     _backend = widget.storage.backendType;
     _gpuLayers = widget.storage.gpuLayers.toDouble();
+    _detectAvailableBackends();
+  }
+
+  /// Static registry check — what the native library actually has
+  /// compiled in and registered on this device, independent of which one
+  /// is currently configured. Cheap (no generation, no reload), so this
+  /// runs automatically rather than waiting for the user to ask.
+  Future<void> _detectAvailableBackends() async {
+    final llm = Get.find<LlmService>();
+    if (!llm.isLoaded.value) return;
+    try {
+      final raw = await llm.getAvailableBackends();
+      if (!mounted) return;
+      setState(() {
+        _detectedBackends = raw
+            .split(',')
+            .map((s) => s.trim())
+            .where((s) => s.isNotEmpty)
+            .toList();
+      });
+    } catch (_) {
+      // Leave null — the UI just won't show a detected-backends line.
+    }
+  }
+
+  Future<void> _runBenchmark() async {
+    final llm = Get.find<LlmService>();
+    if (!llm.isLoaded.value) {
+      Get.snackbar(
+        'No Model Loaded',
+        'Load a model first — the benchmark needs a real model to test '
+            'each backend against.',
+        snackPosition: SnackPosition.BOTTOM,
+      );
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: ctx.bgPanel,
+        title: Text('Benchmark Backends?', style: TextStyle(color: ctx.text)),
+        content: Text(
+          'Reloads the current model once per backend and times a short '
+          'real generation on each — CPU vs. GPU (Vulkan/OpenCL, whichever '
+          'this device actually has). Takes roughly a minute and the model '
+          'will be unavailable for chat while it runs. Your original '
+          'backend setting is restored afterward either way.',
+          style: TextStyle(color: ctx.textM, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('Cancel', style: TextStyle(color: ctx.textD)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.accent, elevation: 0),
+            child: const Text('Run It', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() {
+      _benchmarking = true;
+      _benchmarkResults = null;
+      _benchmarkingCurrent = null;
+    });
+
+    try {
+      // Falls back to testing all three whenever the detected-backends
+      // filter doesn't leave anything recognizable — not just when
+      // detection itself failed (null), but also when it succeeded with
+      // names this app doesn't recognize (e.g. a backend string other than
+      // cpu/vulkan/opencl) and the filter zeroed the list out.
+      final recognized = _detectedBackends
+          ?.map((b) => b.toLowerCase())
+          .where((b) => b.contains('cpu') || b.contains('vulkan') || b.contains('opencl'))
+          .map((b) {
+            if (b.contains('vulkan')) return 'vulkan';
+            if (b.contains('opencl')) return 'opencl';
+            return 'cpu';
+          })
+          .toSet()
+          .toList();
+      final results = await llm.benchmarkBackends(
+        backends:
+            (recognized == null || recognized.isEmpty) ? const ['cpu', 'vulkan', 'opencl'] : recognized,
+        onProgress: (backend) {
+          if (mounted) setState(() => _benchmarkingCurrent = backend);
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _benchmarking = false;
+        _benchmarkResults = results;
+        // Re-sync with whatever benchmarkBackends restored, in case it
+        // differs from what this widget had cached.
+        _backend = widget.storage.backendType;
+        _gpuLayers = widget.storage.gpuLayers.toDouble();
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _benchmarking = false);
+      Get.snackbar('Benchmark Failed', '$e', snackPosition: SnackPosition.BOTTOM);
+    }
+  }
+
+  void _applyBenchmarkWinner(BackendBenchmarkResult winner) {
+    setState(() {
+      _backend = winner.backend;
+      _gpuLayers = winner.backend == 'cpu' ? 0 : 33;
+    });
+    widget.storage.backendType = _backend;
+    widget.storage.gpuLayers = _gpuLayers.toInt();
+    Get.snackbar(
+      'Applied',
+      '${_backendLabel(winner.backend)} set as active — reload the model '
+          'for it to take effect on your next chat.',
+      snackPosition: SnackPosition.BOTTOM,
+    );
+  }
+
+  String _backendLabel(String backend) {
+    switch (backend) {
+      case 'vulkan':
+        return 'GPU (Vulkan)';
+      case 'opencl':
+        return 'GPU (OpenCL)';
+      default:
+        return 'CPU';
+    }
   }
 
   void _applyAutoConfig() {
@@ -1769,6 +2433,49 @@ class _HardwareSettingsCardState extends State<_HardwareSettingsCard> {
               ],
             ),
           ),
+
+          const SizedBox(height: 16),
+
+          // ── Real backend benchmark ──
+          if (_detectedBackends != null) ...[
+            Text(
+              'Detected on this device: ${_detectedBackends!.join(", ")}',
+              style: TextStyle(color: context.textD, fontSize: 11),
+            ),
+            const SizedBox(height: 8),
+          ],
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: _benchmarking ? null : _runBenchmark,
+              icon: _benchmarking
+                  ? SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: context.textM),
+                    )
+                  : const Icon(Icons.speed_rounded, size: 16),
+              label: Text(
+                _benchmarking
+                    ? 'Testing ${_backendLabel(_benchmarkingCurrent ?? "")}...'
+                    : 'Benchmark Backends On This Device',
+              ),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: context.text,
+                side: BorderSide(color: context.border),
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+            ),
+          ),
+          if (_benchmarkResults != null) ...[
+            const SizedBox(height: 10),
+            _BenchmarkResultsList(
+              results: _benchmarkResults!,
+              onApply: _applyBenchmarkWinner,
+              backendLabel: _backendLabel,
+            ),
+          ],
 
           const SizedBox(height: 16),
 

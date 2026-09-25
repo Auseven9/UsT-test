@@ -9,6 +9,9 @@ import '../services/log_service.dart';
 import '../services/embedding_service.dart';
 import '../services/helper_llm_service.dart';
 import '../services/memory_service.dart';
+import '../services/reasoning_trace_service.dart';
+import '../services/reminder_service.dart';
+import '../services/tutorial_service.dart';
 import '../services/crash_log_service.dart';
 import '../services/resource_monitor_service.dart';
 import '../controllers/chat_controller.dart';
@@ -29,6 +32,12 @@ class AppBindings extends Bindings {
     Get.lazyPut(() => EmbeddingService(), fenix: true);
     Get.lazyPut(() => HelperLlmService(), fenix: true);
     Get.lazyPut(() => MemoryService(), fenix: true);
+    Get.lazyPut(() => ReasoningTraceService(), fenix: true);
+    Get.lazyPut(() => ReminderService(), fenix: true);
+    // Constructed lazily, only once HomeScreen actually needs it — by then
+    // ChatStorageService (which it reads/writes the completed flag
+    // through) is already fully initialized by splash_screen.dart.
+    Get.lazyPut(() => TutorialService(), fenix: true);
     // Already constructed and recording in main() before bindings run —
     // register that exact instance rather than a fresh one.
     Get.put(CrashLogService.instance, permanent: true);

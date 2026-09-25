@@ -217,7 +217,8 @@ class ChatStorageService extends GetxService {
       _settingsBox.put('custom_chat_template', value);
 
   /// Whether the model is given tool-calling access (current date/time, a
-  /// calculator, and read-only memory search — see tool_definitions.dart).
+  /// calculator, and memory search/write — see tool_definitions.dart; the
+  /// write tools are additionally gated on [persistentMemoryEnabled]).
   /// Defaults on. Tool schemas add real prompt overhead on every turn even
   /// when unused, so this is a genuine off switch, not just cosmetic.
   bool get toolsEnabled =>
@@ -234,4 +235,64 @@ class ChatStorageService extends GetxService {
 
   set enableModelThinking(bool value) =>
       _settingsBox.put('enable_model_thinking', value);
+
+  // ── Advanced tools, self-critique, reasoning trace ──────────
+
+  /// Whether the model is given clipboard access, in-app reminders, and
+  /// reasoning recall (see tool_definitions.dart's `includeAdvancedTools`).
+  /// Separate from [toolsEnabled] and [persistentMemoryEnabled] — this is
+  /// its own capability class, off by default is NOT the choice here
+  /// (clipboard/reminders are low-risk, on-device, no network) but the
+  /// toggle exists so it can be turned off cleanly like every other tool
+  /// group.
+  bool get advancedToolsEnabled =>
+      _settingsBox.get('advanced_tools_enabled', defaultValue: true) as bool;
+
+  set advancedToolsEnabled(bool value) =>
+      _settingsBox.put('advanced_tools_enabled', value);
+
+  /// Whether a bounded second generation (helper model if armed, main model
+  /// otherwise) reviews each answer for contradictions with memory or
+  /// obvious overconfidence after it's given. Costs a background
+  /// generation per turn, so it's a genuine off switch, not cosmetic — with
+  /// it off the app behaves exactly as before this feature existed.
+  bool get selfCritiqueEnabled =>
+      _settingsBox.get('self_critique_enabled', defaultValue: true) as bool;
+
+  set selfCritiqueEnabled(bool value) =>
+      _settingsBox.put('self_critique_enabled', value);
+
+  /// Whether each turn's chain-of-thought (when the model produced one) gets
+  /// distilled into a short gist and stored in the reasoning-trace lane
+  /// (see ReasoningTraceService) for later recall. With it off, nothing is
+  /// written to that lane and existing traces are left untouched.
+  bool get reasoningTraceEnabled =>
+      _settingsBox.get('reasoning_trace_enabled', defaultValue: true) as bool;
+
+  set reasoningTraceEnabled(bool value) =>
+      _settingsBox.put('reasoning_trace_enabled', value);
+
+  /// n-gram self-speculative decoding (llamadart's
+  /// SpeculativeDecodingConfig.ngramSimple) on the main chat generation —
+  /// drafts from tokens already in the current turn's context, verified in
+  /// one batch by the same model; never changes what gets generated, only
+  /// how fast. Off by default: unlike the CPU-vs-GPU story this is a much
+  /// newer capability with no on-device measurement yet on this app's
+  /// actual hardware, so it starts opt-in rather than assumed-safe.
+  bool get speculativeDecodingEnabled =>
+      _settingsBox.get('speculative_decoding_enabled', defaultValue: false) as bool;
+
+  set speculativeDecodingEnabled(bool value) =>
+      _settingsBox.put('speculative_decoding_enabled', value);
+
+  // ── Onboarding tutorial ──────────────────────────────────────
+
+  /// Whether the guided tour has been completed or explicitly skipped —
+  /// either way, it stops auto-starting on launch. Replaying it from
+  /// Settings doesn't change this until it's skipped/finished again.
+  bool get tutorialCompleted =>
+      _settingsBox.get('tutorial_completed', defaultValue: false) as bool;
+
+  set tutorialCompleted(bool value) =>
+      _settingsBox.put('tutorial_completed', value);
 }

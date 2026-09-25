@@ -4,11 +4,15 @@ import 'package:get/get.dart';
 import '../theme/app_colors.dart';
 import '../models/memory_entry.dart';
 import '../services/memory_service.dart';
+import '../services/embedding_service.dart';
 import '../routes/app_routes.dart';
 
 /// Browser for the persistent memory directory — every distilled note the
-/// app has stored across conversations, with the ability to delete
-/// individual entries or clear everything.
+/// app has stored across conversations. Supports deleting, manually adding,
+/// and manually editing entries in place — the automatic pipelines (per-
+/// turn extraction, the model's own remember/update_memory/supersede_memory
+/// tools, the consolidation sweep) all write through the same MemoryService
+/// methods this screen's manual controls call directly.
 class MemoryScreen extends StatelessWidget {
   const MemoryScreen({super.key});
 
@@ -18,6 +22,12 @@ class MemoryScreen extends StatelessWidget {
 
     return Scaffold(
       backgroundColor: context.bg,
+      floatingActionButton: FloatingActionButton(
+        onPressed: () => _openEditDialog(context, memory, existing: null),
+        tooltip: 'Add a memory manually',
+        backgroundColor: AppColors.accent,
+        child: const Icon(Icons.add_rounded, color: Colors.white),
+      ),
       body: Column(
         children: [
           Container(
@@ -91,7 +101,8 @@ class MemoryScreen extends StatelessWidget {
                         padding: const EdgeInsets.symmetric(horizontal: 40),
                         child: Text(
                           'Notes appear here automatically as older parts of '
-                          'long conversations get distilled for later recall.',
+                          'long conversations get distilled for later recall '
+                          '— or tap + to add one yourself.',
                           textAlign: TextAlign.center,
                           style: TextStyle(color: context.textD, fontSize: 12),
                         ),
@@ -102,13 +113,14 @@ class MemoryScreen extends StatelessWidget {
               }
 
               return ListView.builder(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 88),
                 itemCount: entries.length,
                 itemBuilder: (context, index) {
                   final entry = entries[index];
                   return _MemoryTile(
                     entry: entry,
                     onDelete: () => memory.delete(entry.id),
+                    onEdit: () => _openEditDialog(context, memory, existing: entry),
                   );
                 },
               );
@@ -150,13 +162,213 @@ class MemoryScreen extends StatelessWidget {
       ),
     );
   }
+
+  /// Shared dialog for both manual add ([existing] null) and manual edit
+  /// ([existing] set) — re-embeds through the live embedding model when
+  /// text actually changes (add always embeds; edit only if the text
+  /// field differs from what's stored), since a stored memory's vector
+  /// must always match its stored text or retrieval silently drifts from
+  /// what the text actually says.
+  void _openEditDialog(
+    BuildContext context,
+    MemoryService memory, {
+    required MemoryEntry? existing,
+  }) {
+    final textController = TextEditingController(text: existing?.text ?? '');
+    var category = existing?.category ?? 'general';
+    var valence = existing?.valence ?? 'neutral';
+    var memoryType = existing?.memoryType ?? 'episodic';
+    var subject = existing?.subject ?? 'user';
+    // Includes 'summary' — not a category anything picks from this dialog,
+    // but memory consolidation (ChatController._runMemoryConsolidation)
+    // writes entries with that category, and editing one of those must not
+    // crash the dropdown for having a value with no matching item.
+    const categories = ['fact', 'preference', 'event', 'instruction', 'general', 'summary'];
+    const valences = ['positive', 'negative', 'neutral'];
+    const memoryTypes = ['episodic', 'semantic'];
+    const subjects = ['user', 'assistant'];
+    var busy = false;
+
+    showDialog(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setState) => AlertDialog(
+          backgroundColor: dialogContext.bgPanel,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Text(
+            existing == null ? 'Add Memory' : 'Edit Memory',
+            style: TextStyle(color: dialogContext.text),
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: textController,
+                  maxLines: 4,
+                  autofocus: existing == null,
+                  style: TextStyle(color: dialogContext.text, fontSize: 13),
+                  decoration: InputDecoration(
+                    hintText: 'What should be remembered?',
+                    hintStyle: TextStyle(color: dialogContext.textD),
+                    filled: true,
+                    fillColor: dialogContext.bgInput,
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                _dropdownRow(dialogContext, 'Category', category, categories,
+                    (v) => setState(() => category = v)),
+                _dropdownRow(dialogContext, 'Valence', valence, valences,
+                    (v) => setState(() => valence = v)),
+                _dropdownRow(dialogContext, 'Type', memoryType, memoryTypes,
+                    (v) => setState(() => memoryType = v)),
+                _dropdownRow(dialogContext, 'Subject', subject, subjects,
+                    (v) => setState(() => subject = v)),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: busy ? null : () => Navigator.pop(dialogContext),
+              child: Text('Cancel', style: TextStyle(color: dialogContext.textD)),
+            ),
+            ElevatedButton(
+              onPressed: busy
+                  ? null
+                  : () async {
+                      final text = textController.text.trim();
+                      if (text.isEmpty) return;
+                      setState(() => busy = true);
+                      final embeddingService = Get.find<EmbeddingService>();
+                      // Only a new entry or a real text change needs a
+                      // fresh vector — a pure category/valence/type/subject
+                      // edit on unchanged text doesn't, and shouldn't be
+                      // blocked just because no embedding model happens to
+                      // be loaded right now.
+                      final needsEmbedding = existing == null || text != existing.text;
+                      if (needsEmbedding && !embeddingService.isLoaded.value) {
+                        Navigator.pop(dialogContext);
+                        Get.snackbar(
+                          'No Embedding Model',
+                          'Set an embedding model in Settings > Persistent '
+                              'Memory before adding or changing a memory\'s text.',
+                          snackPosition: SnackPosition.BOTTOM,
+                        );
+                        return;
+                      }
+                      if (existing == null) {
+                        final vector = await embeddingService.embed(text);
+                        if (!dialogContext.mounted) return;
+                        if (vector == null) {
+                          Navigator.pop(dialogContext);
+                          Get.snackbar(
+                            'Embedding Failed',
+                            'Could not add this memory — the embedding '
+                                'model didn\'t respond. Nothing was saved.',
+                            snackPosition: SnackPosition.BOTTOM,
+                          );
+                          return;
+                        }
+                        await memory.add(
+                          text,
+                          vector,
+                          category: category,
+                          valence: valence,
+                          memoryType: memoryType,
+                          subject: subject,
+                          tags: const ['manual'],
+                        );
+                      } else {
+                        final textChanged = text != existing.text;
+                        final vector =
+                            textChanged ? await embeddingService.embed(text) : null;
+                        if (!dialogContext.mounted) return;
+                        if (textChanged && vector == null) {
+                          Navigator.pop(dialogContext);
+                          Get.snackbar(
+                            'Embedding Failed',
+                            'Could not update this memory\'s text — the '
+                                'embedding model didn\'t respond. Nothing was '
+                                'changed.',
+                            snackPosition: SnackPosition.BOTTOM,
+                          );
+                          return;
+                        }
+                        await memory.updateEntry(
+                          existing.id,
+                          text: textChanged ? text : null,
+                          newEmbedding: vector,
+                          category: category,
+                          valence: valence,
+                          memoryType: memoryType,
+                          subject: subject,
+                        );
+                      }
+                      if (!dialogContext.mounted) return;
+                      Navigator.pop(dialogContext);
+                    },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.accent,
+                elevation: 0,
+              ),
+              child: busy
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                    )
+                  : Text(existing == null ? 'Add' : 'Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _dropdownRow(
+    BuildContext context,
+    String label,
+    String value,
+    List<String> options,
+    ValueChanged<String> onChanged,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 70,
+            child: Text(label, style: TextStyle(fontSize: 12, color: context.textD)),
+          ),
+          Expanded(
+            child: DropdownButton<String>(
+              value: value,
+              isExpanded: true,
+              dropdownColor: context.bgPanel,
+              style: TextStyle(fontSize: 13, color: context.text),
+              underline: Container(height: 1, color: context.border),
+              items: options
+                  .map((o) => DropdownMenuItem(value: o, child: Text(o)))
+                  .toList(),
+              onChanged: (v) {
+                if (v != null) onChanged(v);
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class _MemoryTile extends StatelessWidget {
   final MemoryEntry entry;
   final VoidCallback onDelete;
+  final VoidCallback onEdit;
 
-  const _MemoryTile({required this.entry, required this.onDelete});
+  const _MemoryTile({required this.entry, required this.onDelete, required this.onEdit});
 
   @override
   Widget build(BuildContext context) {
@@ -169,49 +381,63 @@ class _MemoryTile extends StatelessWidget {
         border: Border.all(color: superseded ? context.borderFaint : context.border),
         borderRadius: BorderRadius.circular(12),
       ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 4,
-                  children: [
-                    _chip(context, entry.category, _categoryColor(context, entry.category)),
-                    _chip(context, entry.valence, _valenceColor(context, entry.valence)),
-                    for (final tag in entry.tags) _chip(context, tag, context.textD),
-                    if (superseded) _chip(context, 'superseded', AppColors.red),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  entry.text,
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: superseded ? context.textD : context.text,
-                    height: 1.4,
-                    decoration: superseded ? TextDecoration.lineThrough : null,
+      child: InkWell(
+        onTap: onEdit,
+        borderRadius: BorderRadius.circular(8),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 4,
+                    children: [
+                      _chip(context, entry.category, _categoryColor(context, entry.category)),
+                      _chip(context, entry.valence, _valenceColor(context, entry.valence)),
+                      if (entry.memoryType == 'semantic')
+                        _chip(context, 'semantic', AppColors.accentHi),
+                      if (entry.subject == 'assistant')
+                        _chip(context, 'assistant', AppColors.orange),
+                      if (entry.isWorkingMemory)
+                        _chip(context, 'working', context.textD),
+                      if (entry.confidence < 0.8)
+                        _chip(context, 'low confidence', AppColors.orange),
+                      for (final tag in entry.tags) _chip(context, tag, context.textD),
+                      if (superseded) _chip(context, 'superseded', AppColors.red),
+                    ],
                   ),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  '${_formatDate(entry.createdAt)}'
-                  '${entry.accessCount > 0 ? ' · recalled ${entry.accessCount}×' : ''}'
-                  '${entry.linkedIds.isNotEmpty ? ' · ${entry.linkedIds.length} linked' : ''}',
-                  style: TextStyle(fontSize: 11, color: context.textD),
-                ),
-              ],
+                  const SizedBox(height: 8),
+                  Text(
+                    entry.text,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: superseded ? context.textD : context.text,
+                      height: 1.4,
+                      decoration: superseded ? TextDecoration.lineThrough : null,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '${_formatDate(entry.createdAt)}'
+                    '${entry.accessCount > 0 ? ' · recalled ${entry.accessCount}×' : ''}'
+                    '${entry.rehearsalCount > 0 ? ' · rehearsed ${entry.rehearsalCount}×' : ''}'
+                    '${entry.linkedIds.isNotEmpty ? ' · ${entry.linkedIds.length} linked' : ''}'
+                    '${entry.priorTexts.isNotEmpty ? ' · ${entry.priorTexts.length} prior version${entry.priorTexts.length == 1 ? '' : 's'}' : ''}',
+                    style: TextStyle(fontSize: 11, color: context.textD),
+                  ),
+                ],
+              ),
             ),
-          ),
-          IconButton(
-            icon: Icon(Icons.close_rounded, size: 16, color: context.textD),
-            onPressed: onDelete,
-            tooltip: 'Delete this memory',
-          ),
-        ],
+            IconButton(
+              icon: Icon(Icons.close_rounded, size: 16, color: context.textD),
+              onPressed: onDelete,
+              tooltip: 'Delete this memory',
+            ),
+          ],
+        ),
       ),
     );
   }

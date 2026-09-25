@@ -119,6 +119,10 @@ class MemoryService extends GetxService {
     String category = 'general',
     String valence = 'neutral',
     List<String> tags = const [],
+    double confidence = 1.0,
+    String memoryType = 'episodic',
+    String subject = 'user',
+    bool isWorkingMemory = false,
   }) async {
     if (text.trim().isEmpty || embedding.isEmpty) return null;
 
@@ -140,6 +144,10 @@ class MemoryService extends GetxService {
       valence: valence,
       tags: tags,
       linkedIds: linkedIds,
+      confidence: confidence.clamp(0.0, 1.0),
+      memoryType: memoryType,
+      subject: subject,
+      isWorkingMemory: isWorkingMemory,
     ));
     await _persist();
     return id;
@@ -237,6 +245,10 @@ class MemoryService extends GetxService {
     List<String> tags = const [],
     double dupThreshold = 0.92,
     bool Function(MemoryEntry)? scope,
+    double confidence = 1.0,
+    String memoryType = 'episodic',
+    String subject = 'user',
+    bool isWorkingMemory = false,
   }) async {
     final trimmedNew = text.trim();
     if (trimmedNew.isEmpty || embedding.isEmpty) {
@@ -279,6 +291,12 @@ class MemoryService extends GetxService {
                 text: trimmedNew,
                 embedding: embedding,
                 tags: {...existing.tags, ...tags}.toList(),
+                // Keep the wording this entry is about to lose — provenance,
+                // not just the latest state. The superseded-correction path
+                // already keeps the full old entry untouched; enrichment
+                // updates in place, so without this the prior wording would
+                // just be gone with no record it ever said that.
+                priorTexts: [...existing.priorTexts, existing.text],
                 // The embedding just changed, possibly substantially (a
                 // bare name enriched into a full sentence) — recompute
                 // this entry's place in the associative graph rather than
@@ -303,6 +321,10 @@ class MemoryService extends GetxService {
       category: category,
       valence: valence,
       tags: tags,
+      confidence: confidence,
+      memoryType: memoryType,
+      subject: subject,
+      isWorkingMemory: isWorkingMemory,
     );
     return (wasNew: true, wasEnriched: false, id: newId);
   }
@@ -319,24 +341,188 @@ class MemoryService extends GetxService {
     await _persist();
   }
 
-  Future<void> delete(String id) async {
-    // Clean up dangling references before removing the entry — otherwise
-    // other entries keep pointing at an id that no longer exists: a
-    // neighbor's linkedIds would silently miscount its associations, and a
-    // memory this one superseded would stay hidden from retrieval forever
-    // even though nothing contradicts it anymore.
+  /// Confidence threshold above which a correction is trusted enough to
+  /// outright replace the old fact. Below it, both stay active — see
+  /// [resolveContradiction].
+  static const confidentCorrectionThreshold = 0.6;
+
+  /// What happens when a new memory contradicts an existing one, gated on
+  /// how confident the extraction was that the new one is actually right.
+  /// A high-confidence correction supersedes the old fact outright (the
+  /// original behavior: old entry marked superseded, stays visible but
+  /// stops competing in recall). A low-confidence one is NOT trusted to
+  /// overwrite anything — instead it's stored as a new, still-active entry,
+  /// linked to the one it conflicts with and tagged 'conflicting' on both
+  /// sides, so a human (or a future, more confident exchange) can resolve
+  /// which one is actually true instead of the app silently picking one.
+  /// This is competing-hypothesis tracking, not full probabilistic belief
+  /// revision — there's no formal posterior here, just "don't overwrite on
+  /// a guess."
+  Future<bool> resolveContradiction({
+    required String oldId,
+    required String newText,
+    required List<double> newEmbedding,
+    required double confidence,
+    String category = 'general',
+    String valence = 'neutral',
+    List<String> tags = const [],
+    String? sourceChatId,
+  }) async {
+    final oldIdx = entries.indexWhere((e) => e.id == oldId);
+    if (oldIdx == -1) return false;
+
+    if (confidence >= confidentCorrectionThreshold) {
+      final newId = await add(
+        newText,
+        newEmbedding,
+        sourceChatId: sourceChatId,
+        category: category,
+        valence: valence,
+        tags: tags,
+        confidence: confidence,
+      );
+      if (newId == null) return false;
+      await markSuperseded(oldId, newId);
+      return true;
+    }
+
+    // Low confidence: keep both. Link them to each other directly (bypasses
+    // the normal similarity-threshold linking in _relink, since these two
+    // are related by contradiction, not just topical similarity) and tag
+    // both 'conflicting' so the memory browser and retrieval context can
+    // flag the ambiguity instead of presenting either as settled fact.
+    final newId = await add(
+      newText,
+      newEmbedding,
+      sourceChatId: sourceChatId,
+      category: category,
+      valence: valence,
+      tags: {...tags, 'conflicting'}.toList(),
+      confidence: confidence,
+      // An unverified, low-confidence guess is no more trustworthy just
+      // because it happened to contradict something — same probation as
+      // every other auto-extracted memory, so it decays away via
+      // runWorkingMemoryMaintenance if never reinforced instead of
+      // cluttering the store permanently.
+      isWorkingMemory: true,
+    );
+    if (newId == null) return false;
+    await linkManually(oldId, newId);
+    final oldIdxAfter = entries.indexWhere((e) => e.id == oldId);
+    if (oldIdxAfter != -1 && !entries[oldIdxAfter].tags.contains('conflicting')) {
+      entries[oldIdxAfter] = entries[oldIdxAfter]
+          .copyWith(tags: [...entries[oldIdxAfter].tags, 'conflicting']);
+      await _persist();
+    }
+    return true;
+  }
+
+  /// Directly edits an existing entry — the manual-edit path (memory
+  /// browser) and the model's own `update_memory` tool both go through
+  /// this. [newEmbedding] must be supplied by the caller when [text]
+  /// changes (this service has no embedding model of its own to recompute
+  /// it with); omitting it while changing [text] leaves the old embedding
+  /// in place, which would silently desync the stored vector from the
+  /// stored text — callers that change text MUST pass the new embedding.
+  /// Returns false if [id] doesn't exist.
+  Future<bool> updateEntry(
+    String id, {
+    String? text,
+    List<double>? newEmbedding,
+    String? category,
+    String? valence,
+    List<String>? tags,
+    String? memoryType,
+    String? subject,
+  }) async {
+    final idx = entries.indexWhere((e) => e.id == id);
+    if (idx == -1) return false;
+    final existing = entries[idx];
+    final textChanged = text != null && text.trim() != existing.text;
+    entries[idx] = existing.copyWith(
+      text: textChanged ? text.trim() : null,
+      embedding: textChanged ? newEmbedding : null,
+      priorTexts: textChanged ? [...existing.priorTexts, existing.text] : null,
+      linkedIds: (textChanged && newEmbedding != null)
+          ? _relink(id, newEmbedding)
+          : null,
+      category: category,
+      valence: valence,
+      tags: tags,
+      memoryType: memoryType,
+      subject: subject,
+      lastAccessedAt: DateTime.now(),
+    );
+    await _persist();
+    return true;
+  }
+
+  /// Explicit, user- or model-directed link between two memories —
+  /// bypasses the automatic similarity threshold entirely, since a person
+  /// (or the model) saying "these two are related" is a stronger signal
+  /// than embedding distance. Still respects the same link cap as
+  /// automatic linking, FIFO-dropping the oldest if either side is full.
+  Future<void> linkManually(String idA, String idB) async {
+    if (idA == idB) return;
+    final idxA = entries.indexWhere((e) => e.id == idA);
+    final idxB = entries.indexWhere((e) => e.id == idB);
+    if (idxA == -1 || idxB == -1) return;
+    void addLink(int idx, String otherId) {
+      if (entries[idx].linkedIds.contains(otherId)) return;
+      final updated = [...entries[idx].linkedIds, otherId];
+      final trimmed = updated.length > _maxLinksPerNode
+          ? updated.sublist(updated.length - _maxLinksPerNode)
+          : updated;
+      entries[idx] = entries[idx].copyWith(linkedIds: trimmed);
+    }
+
+    addLink(idxA, idB);
+    addLink(idxB, idA);
+    await _persist();
+  }
+
+  Future<void> unlinkManually(String idA, String idB) async {
+    final idxA = entries.indexWhere((e) => e.id == idA);
+    final idxB = entries.indexWhere((e) => e.id == idB);
+    if (idxA != -1) {
+      entries[idxA] = entries[idxA]
+          .copyWith(linkedIds: entries[idxA].linkedIds.where((l) => l != idB).toList());
+    }
+    if (idxB != -1) {
+      entries[idxB] = entries[idxB]
+          .copyWith(linkedIds: entries[idxB].linkedIds.where((l) => l != idA).toList());
+    }
+    await _persist();
+  }
+
+  Future<void> delete(String id) => deleteMany({id});
+
+  /// Same cleanup as [delete] but for a whole batch in one pass — one
+  /// O(entries) dangling-reference scan and one disk write regardless of
+  /// how many ids are being removed, instead of paying that cost once per
+  /// id. Callers dropping several entries at once (e.g.
+  /// [runWorkingMemoryMaintenance]'s decay pass) should use this instead of
+  /// looping [delete].
+  Future<void> deleteMany(Set<String> ids) async {
+    if (ids.isEmpty) return;
+    // Clean up dangling references before removing the entries —
+    // otherwise other entries keep pointing at an id that no longer
+    // exists: a neighbor's linkedIds would silently miscount its
+    // associations, and a memory one of these superseded would stay
+    // hidden from retrieval forever even though nothing contradicts it
+    // anymore.
     for (var i = 0; i < entries.length; i++) {
       final e = entries[i];
-      final needsUnlink = e.linkedIds.contains(id);
-      final needsUnsupersede = e.supersededBy == id;
+      final needsUnlink = e.linkedIds.any(ids.contains);
+      final needsUnsupersede = e.supersededBy != null && ids.contains(e.supersededBy);
       if (!needsUnlink && !needsUnsupersede) continue; // most entries, most deletes
 
       entries[i] = e.copyWith(
-        linkedIds: needsUnlink ? e.linkedIds.where((l) => l != id).toList() : null,
+        linkedIds: needsUnlink ? e.linkedIds.where((l) => !ids.contains(l)).toList() : null,
         clearSupersededBy: needsUnsupersede,
       );
     }
-    entries.removeWhere((e) => e.id == id);
+    entries.removeWhere((e) => ids.contains(e.id));
     await _persist();
   }
 
@@ -345,16 +531,26 @@ class MemoryService extends GetxService {
     await _persist();
   }
 
+  /// How many hops of spreading activation retrieval walks outward from a
+  /// direct match. Each hop compounds [_hopDiscount] on top of the
+  /// neighbor's own real similarity to the query — hop 2 is discounted
+  /// twice, so a memory two links away from anything directly relevant has
+  /// to be a genuinely strong match in its own right to still surface.
+  static const _maxHops = 2;
+  static const _hopDiscount = 0.85;
+
   /// Top-[k] most relevant *active* memories to [queryEmbedding] — not a
-  /// flat similarity search, but one hop of spreading activation: direct
+  /// flat similarity search, but multi-hop spreading activation: direct
   /// semantic matches are found first, then their linked neighbors are
-  /// pulled in too (at a discount, since they matched associatively rather
-  /// than directly), and the combined pool is ranked by a blend of semantic
-  /// similarity, recency, and reinforcement (how often/recently recalled) —
-  /// so a frequently-referenced memory can outrank a merely-similar one
-  /// mentioned once and never touched again. Whatever's actually returned
-  /// is itself reinforced (recall strengthens a memory), which is why this
-  /// is not a `const`/pure function despite looking read-only.
+  /// pulled in too (discounted per hop, compounding — see [_maxHops]),
+  /// since they matched associatively rather than directly. The combined
+  /// pool is ranked by a blend of semantic similarity, recency,
+  /// reinforcement, valence, and confidence — so a frequently-referenced,
+  /// emotionally-charged, high-confidence memory can outrank a merely-
+  /// similar one mentioned once, never touched again, and only ever a
+  /// guess. Whatever's actually returned is itself reinforced (recall
+  /// strengthens a memory), which is why this is not a `const`/pure
+  /// function despite looking read-only.
   List<MemoryEntry> topK(
     List<double> queryEmbedding, {
     int k = 3,
@@ -373,7 +569,16 @@ class MemoryService extends GetxService {
       final ageDays = now.difference(mostRecentTouch).inHours / 24.0;
       final recency = pow(0.5, ageDays / _recencyHalfLifeDays).toDouble();
       final reinforcement = (log(e.accessCount + 1) / log(10)).clamp(0.0, 1.0);
-      return similarity * 0.7 + recency * 0.15 + reinforcement * 0.15;
+      // Real psychological memory over-weights emotionally charged content
+      // in recall, not just "was this recent/repeated" — a flat 1.0 for any
+      // non-neutral valence approximates that without pretending to
+      // measure actual emotional intensity, which nothing here captures.
+      final valenceBoost = e.valence == 'neutral' ? 0.0 : 1.0;
+      return similarity * 0.60 +
+          recency * 0.12 +
+          reinforcement * 0.10 +
+          valenceBoost * 0.08 +
+          e.confidence.clamp(0.0, 1.0) * 0.10;
     }
 
     // Pass 1: direct semantic matches.
@@ -384,38 +589,47 @@ class MemoryService extends GetxService {
       if (score >= minScore) direct[entry.id] = score;
     }
 
-    // Pass 2: one hop along the graph from each direct match. Score each
+    // Passes 2..N: spreading activation outward from direct matches, one
+    // hop at a time, each hop's frontier built only from the previous
+    // hop's newly-found ids (not re-walking the whole direct set every
+    // time) so this stays linear in hop count, not exponential. Score each
     // neighbor by its own real similarity to the query (cheap — just more
     // dot products over vectors already in memory, no extra embedding
-    // call), not a proxy derived from the direct match's score — a
-    // neighbor linked to a strong direct hit only because it once scored
-    // just over the write-time link threshold isn't necessarily itself
-    // relevant to *this* query, and scoring it off the direct match's
-    // similarity could let a loosely-related memory crowd out a genuinely
-    // relevant one. A small discount still applies on top of the neighbor's
-    // real similarity, since it only surfaced associatively, not directly.
-    const associativeDiscount = 0.85;
+    // call), not a proxy derived from the previous hop's score — a memory
+    // two links from a strong direct hit only because of the write-time
+    // link threshold isn't necessarily itself relevant to *this* query,
+    // and scoring it off an upstream match's similarity could let a
+    // loosely-related memory crowd out a genuinely relevant one.
     final byId = {for (final e in entries) e.id: e};
     final associative = <String, double>{};
-    for (final id in direct.keys) {
-      final node = byId[id];
-      if (node == null) continue;
-      for (final linkedId in node.linkedIds) {
-        if (direct.containsKey(linkedId) || associative.containsKey(linkedId)) {
-          continue;
+    final visited = {...direct.keys};
+    var frontier = direct.keys.toSet();
+    var discount = _hopDiscount;
+    for (var hop = 0; hop < _maxHops && frontier.isNotEmpty; hop++) {
+      final nextFrontier = <String>{};
+      for (final id in frontier) {
+        final node = byId[id];
+        if (node == null) continue;
+        for (final linkedId in node.linkedIds) {
+          if (visited.contains(linkedId)) continue;
+          final neighbor = byId[linkedId];
+          if (neighbor == null || !neighbor.isActive) continue;
+          final neighborSimilarity =
+              _cosineSimilarity(queryEmbedding, neighbor.embedding) * discount;
+          visited.add(linkedId);
+          // Same floor as direct matches — a memory linked to a real match
+          // only because it once scored just over the write-time link
+          // threshold isn't necessarily relevant to *this* query, and
+          // without this check it could still fill a top-k slot ahead of a
+          // genuinely relevant memory that simply wasn't linked to
+          // anything.
+          if (neighborSimilarity < minScore) continue;
+          associative[linkedId] = neighborSimilarity;
+          nextFrontier.add(linkedId);
         }
-        final neighbor = byId[linkedId];
-        if (neighbor == null || !neighbor.isActive) continue;
-        final neighborSimilarity =
-            _cosineSimilarity(queryEmbedding, neighbor.embedding) * associativeDiscount;
-        // Same floor as direct matches — a memory linked to a real match
-        // only because it once scored just over the write-time link
-        // threshold isn't necessarily relevant to *this* query, and
-        // without this check it could still fill a top-k slot ahead of a
-        // genuinely relevant memory that simply wasn't linked to anything.
-        if (neighborSimilarity < minScore) continue;
-        associative[linkedId] = neighborSimilarity;
       }
+      frontier = nextFrontier;
+      discount *= _hopDiscount;
     }
 
     final scored = <MapEntry<MemoryEntry, double>>[];
@@ -467,6 +681,81 @@ class MemoryService extends GetxService {
       _reinforcementPersistTimer!.cancel();
       await _persist();
     }
+  }
+
+  /// Working-memory maintenance: a short-lived tier (see
+  /// [MemoryEntry.isWorkingMemory]) is captured but not yet trusted as
+  /// permanent — this decides which working-memory entries earned
+  /// permanence and which never got touched again. Called from the
+  /// periodic consolidation sweep, never automatically on its own timer,
+  /// since it's cheap (no inference) but still a real disk write when
+  /// anything changes.
+  ///
+  /// Returns how many were promoted and how many were dropped, for the
+  /// caller to log/report — this is a real maintenance pass, not a no-op,
+  /// and its effects (permanent entries disappearing, others gaining
+  /// permanence) are exactly the kind of thing that should be visible
+  /// rather than silent.
+  Future<({int promoted, int dropped})> runWorkingMemoryMaintenance({
+    Duration decayWindow = const Duration(hours: 24),
+    int promotionAccessThreshold = 2,
+  }) async {
+    final now = DateTime.now();
+    var promoted = 0;
+    final toDrop = <String>[];
+    for (var i = 0; i < entries.length; i++) {
+      final e = entries[i];
+      if (!e.isWorkingMemory) continue;
+      if (e.accessCount >= promotionAccessThreshold) {
+        entries[i] = e.copyWith(isWorkingMemory: false);
+        promoted++;
+      } else if (now.difference(e.lastAccessedAt) > decayWindow) {
+        toDrop.add(e.id);
+      }
+    }
+    if (toDrop.isNotEmpty) {
+      await deleteMany(toDrop.toSet());
+    } else if (promoted > 0) {
+      await _persist();
+    }
+    return (promoted: promoted, dropped: toDrop.length);
+  }
+
+  /// Idle-time rehearsal — re-touches the most important currently-active
+  /// memories (ranked by recency + reinforcement + confidence, no query
+  /// involved since this isn't responding to anything) to keep them fresh
+  /// in [lastAccessedAt] even without a real conversation recalling them.
+  /// This is the "sleep-driven consolidation strengthens what matters"
+  /// half of the design — distinct from [_reinforce], which only fires on
+  /// genuine retrieval. Returns the ids actually rehearsed, for logging.
+  Future<List<String>> rehearseTopMemories({int count = 5}) async {
+    final now = DateTime.now();
+    final active = entries.where((e) => e.isActive && !e.isWorkingMemory).toList();
+    if (active.isEmpty) return const [];
+
+    double importance(MemoryEntry e) {
+      final mostRecentTouch =
+          e.lastAccessedAt.isAfter(e.createdAt) ? e.lastAccessedAt : e.createdAt;
+      final ageDays = now.difference(mostRecentTouch).inHours / 24.0;
+      final recency = pow(0.5, ageDays / _recencyHalfLifeDays).toDouble();
+      final reinforcement = (log(e.accessCount + 1) / log(10)).clamp(0.0, 1.0);
+      return recency * 0.5 + reinforcement * 0.3 + e.confidence.clamp(0.0, 1.0) * 0.2;
+    }
+
+    final ranked = active.toList()
+      ..sort((a, b) => importance(b).compareTo(importance(a)));
+    final chosen = ranked.take(count).toList();
+
+    for (final e in chosen) {
+      final idx = entries.indexWhere((x) => x.id == e.id);
+      if (idx == -1) continue;
+      entries[idx] = entries[idx].copyWith(
+        rehearsalCount: entries[idx].rehearsalCount + 1,
+        lastAccessedAt: now,
+      );
+    }
+    await _persist();
+    return chosen.map((e) => e.id).toList();
   }
 
   double _cosineSimilarity(List<double> a, List<double> b) {

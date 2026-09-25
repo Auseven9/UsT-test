@@ -68,6 +68,22 @@ class _TurnInsightPanelState extends State<TurnInsightPanel> {
                           valence: widget.telemetry.extractedValence!,
                         ),
                       ],
+                      // 0.5 means over half diverged from the model's top
+                      // choice (real signal) or two-plus hedge phrases
+                      // (heuristic fallback — hedgeScore is matchCount/4.0,
+                      // so a single hedge alone scores 0.25 and shouldn't
+                      // flag on its own).
+                      if ((widget.telemetry.uncertainty ?? 0) >= 0.5) ...[
+                        const SizedBox(width: 6),
+                        _UncertaintyChip(
+                          score: widget.telemetry.uncertainty!,
+                          isHeuristic: widget.telemetry.uncertaintyIsHeuristic,
+                        ),
+                      ],
+                      if (widget.telemetry.critiqueFlagged == true) ...[
+                        const SizedBox(width: 6),
+                        const _CritiqueChip(),
+                      ],
                     ],
                   ),
                 ),
@@ -122,7 +138,7 @@ class _TurnInsightPanelState extends State<TurnInsightPanel> {
                         ),
                         const SizedBox(height: 10),
                       ],
-                      if (widget.telemetry.toolCalls.isNotEmpty)
+                      if (widget.telemetry.toolCalls.isNotEmpty) ...[
                         Wrap(
                           spacing: 6,
                           runSpacing: 6,
@@ -130,6 +146,32 @@ class _TurnInsightPanelState extends State<TurnInsightPanel> {
                               .map((t) => _ToolChip(event: t))
                               .toList(),
                         ),
+                        const SizedBox(height: 10),
+                      ],
+                      if (widget.telemetry.critiqueRan &&
+                          widget.telemetry.critiqueNote != null) ...[
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Icon(
+                              widget.telemetry.critiqueFlagged == true
+                                  ? Icons.flag_rounded
+                                  : Icons.check_circle_outline_rounded,
+                              size: 12,
+                              color: widget.telemetry.critiqueFlagged == true
+                                  ? AppColors.orange
+                                  : context.textD,
+                            ),
+                            const SizedBox(width: 4),
+                            Expanded(
+                              child: Text(
+                                'Self-check: ${widget.telemetry.critiqueNote}',
+                                style: TextStyle(fontSize: 10, color: context.textD),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -296,6 +338,76 @@ class _ToolChip extends StatelessWidget {
             Text(event.name, style: TextStyle(fontSize: 10, color: color)),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// Surfaces `TurnTelemetry.uncertainty` — a heuristic hedge-language
+/// density score, not a calibrated probability (see
+/// UncertaintyHeuristics' own doc for why nothing more rigorous is
+/// available here). Only shown once it clears a small threshold, so an
+/// answer with zero or one hedge word doesn't get visually flagged.
+class _UncertaintyChip extends StatelessWidget {
+  final double score;
+  final bool isHeuristic;
+  const _UncertaintyChip({required this.score, required this.isHeuristic});
+
+  @override
+  Widget build(BuildContext context) {
+    final color = score > 0.6 ? AppColors.orange : context.textM;
+    final message = isHeuristic
+        ? 'Hedge-language density in this answer: '
+            '${(score * 100).round()}% (heuristic — the engine couldn\'t '
+            'report real per-token confidence for this turn)'
+        : 'Model uncertainty: ${(score * 100).round()}% (measured from '
+            'real per-token confidence — how far sampling diverged from '
+            'the model\'s own top choice, not a correctness score)';
+    return Tooltip(
+      message: message,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(5),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.help_outline_rounded, size: 10, color: color),
+            const SizedBox(width: 2),
+            Text(
+              isHeuristic ? 'hedged' : 'uncertain',
+              style: TextStyle(fontSize: 9, color: color, fontWeight: FontWeight.w600),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Shown when the self-critique background pass flagged a possible issue
+/// with this answer (a contradiction with memory, or an unsupported
+/// confident claim) — see ChatController._runSelfCritique.
+class _CritiqueChip extends StatelessWidget {
+  const _CritiqueChip();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: AppColors.orange.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(5),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.flag_rounded, size: 10, color: AppColors.orange),
+          const SizedBox(width: 2),
+          Text('self-check', style: TextStyle(fontSize: 9, color: AppColors.orange, fontWeight: FontWeight.w600)),
+        ],
       ),
     );
   }

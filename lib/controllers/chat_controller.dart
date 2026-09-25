@@ -16,6 +16,9 @@ import '../services/embedding_service.dart';
 import '../services/helper_llm_service.dart';
 import '../services/memory_service.dart';
 import '../services/memory_heuristics.dart';
+import '../services/reasoning_trace_service.dart';
+import '../services/reminder_service.dart';
+import '../services/uncertainty_heuristics.dart';
 import '../services/tool_definitions.dart';
 import '../services/log_service.dart';
 
@@ -63,14 +66,21 @@ class ChatController extends GetxController {
   final EmbeddingService _embedding = Get.find<EmbeddingService>();
   final MemoryService _memory = Get.find<MemoryService>();
   final HelperLlmService _helper = Get.find<HelperLlmService>();
+  final ReasoningTraceService _reasoningTraces = Get.find<ReasoningTraceService>();
+  final ReminderService _reminders = Get.find<ReminderService>();
 
-  // Rebuilt on every call rather than cached — `includeMemorySearch` must
+  // Rebuilt on every call rather than cached — `includeMemoryTools` must
   // track the user's live Persistent Memory setting, since a model still
   // holding a `search_memory` tool from before the user turned that setting
   // off would keep reading memories the toggle was meant to stop exposing.
+  // Same reasoning for `includeAdvancedTools` and the Advanced Tools switch.
   List<ToolDefinition> get _tools => buildToolDefinitions(
         memory: _memory,
-        includeMemorySearch: _storage.persistentMemoryEnabled,
+        embedding: _embedding,
+        reasoningTraces: _reasoningTraces,
+        reminders: _reminders,
+        includeMemoryTools: _storage.persistentMemoryEnabled,
+        includeAdvancedTools: _storage.advancedToolsEnabled,
       );
 
   LogService? get _log {
@@ -195,10 +205,11 @@ class ChatController extends GetxController {
           content: const Text(
             'Verifies each configured model is actually armed, probes the '
             'embedding model with a real request, and flushes any pending '
-            'memory write to disk. If everything checks out and a helper '
-            'model is armed, it also runs one more short generation to '
-            'look for connections across recent memories — which can add '
-            'a new note of its own.',
+            'memory write to disk. If everything checks out, it also '
+            'promotes or drops working-memory entries, rehearses the most '
+            'important memories, and — if a helper model is armed — runs '
+            'one more short generation to look for connections across '
+            'recent memories, which can add a new note of its own.',
           ),
           actions: [
             TextButton(
@@ -282,8 +293,41 @@ class ChatController extends GetxController {
     // actually healthy — no point spending a generation looking for
     // connections across memory on top of a setup that's already known to
     // be broken.
-    if (problems.isEmpty) {
+    if (problems.isEmpty && _storage.persistentMemoryEnabled) {
+      // Working-memory maintenance and rehearsal are both cheap (no
+      // inference — maintenance is pure bookkeeping, rehearsal just
+      // re-touches timestamps) so they run regardless of whether
+      // consolidation itself (which does spend a generation) goes on to
+      // find anything. Gated on the toggle like consolidation below —
+      // with Persistent Memory off, nothing should touch the store even
+      // if the sweep itself still ran with just the main model armed.
+      final maintenance = await _memory.runWorkingMemoryMaintenance();
+      if (maintenance.promoted > 0 || maintenance.dropped > 0) {
+        _log?.info(
+          'Working-memory maintenance: ${maintenance.promoted} promoted, '
+          '${maintenance.dropped} dropped (never reinforced).',
+          source: 'Memory',
+        );
+      }
+      final rehearsed = await _memory.rehearseTopMemories();
+      if (rehearsed.isNotEmpty) {
+        _log?.info('Rehearsed ${rehearsed.length} memories.', source: 'Memory');
+      }
       await _runMemoryConsolidation();
+    }
+
+    // Reasoning-trace lane maintenance runs on its own toggle, independent
+    // of Persistent Memory — it's a different lane (see
+    // ReasoningTraceService) and shouldn't wait on fact-memory health.
+    if (_storage.reasoningTraceEnabled) {
+      final traceMaintenance = await _reasoningTraces.runLaneMaintenance();
+      if (traceMaintenance.compressed > 0 || traceMaintenance.dropped > 0) {
+        _log?.info(
+          'Reasoning-trace lane maintenance: ${traceMaintenance.compressed} '
+          'compressed, ${traceMaintenance.dropped} dropped.',
+          source: 'Reasoning',
+        );
+      }
     }
   }
 
@@ -527,18 +571,19 @@ class ChatController extends GetxController {
     List<MemoryEntry> relevantMemoriesForTurn = const [];
     final trimmedText = text.trim();
     if (_storage.persistentMemoryEnabled && _embedding.isLoaded.value) {
-      // The model has no memory-write tool (search_memory is read-only, by
-      // design — see tool_definitions.dart) because storage isn't its job:
-      // it happens automatically in the background after the turn. Without
-      // being told that, a model asked to "remember X" — finding no save
-      // tool available — tends to narrate as if it saved something anyway
-      // ("I'm filing that away"), which is a little dishonest since it did
-      // nothing of the kind. One short line heads that off.
+      // The model now has real memory-write tools (remember, update_memory,
+      // supersede_memory — see tool_definitions.dart), on top of durable
+      // facts still being captured automatically in the background after
+      // every turn regardless. Both are real and can both fire on the same
+      // fact — that's fine, MemoryService's near-duplicate/enrichment
+      // logic dedupes it the same way it would any other repeat.
       effectiveSystemPrompt =
-          '$effectiveSystemPrompt\n\nDurable facts and preferences worth '
-          'remembering are captured automatically in the background after '
-          'each message — you have no tool for this and don\'t need one; '
-          'just answer naturally.';
+          '$effectiveSystemPrompt\n\nDurable facts and preferences are also '
+          'captured automatically in the background after each message, '
+          'independent of anything you do — you don\'t need to call '
+          'remember for something to be saved, but you can, especially '
+          'for a correction (supersede_memory) or something you want '
+          'saved with a specific wording right now.';
 
       if (!MemoryHeuristics.looksTrivial(trimmedText) && _memory.entries.isNotEmpty) {
         queryVector = await _embedding.embed(trimmedText);
@@ -607,11 +652,15 @@ class ChatController extends GetxController {
     // old 5s: extraction is a real (if short) generation now, not just an
     // embedding call, and can take a while on a slow device.
     var waitedMs = 0;
-    // Must exceed the background extraction call's own 20s timeout below —
-    // otherwise this gives up first and throws while extraction is still
-    // legitimately (if slowly) running, which is the exact error this wait
-    // loop exists to avoid.
-    while (_llm.isGenerating.value && waitedMs < 21000) {
+    // Must exceed the worst case of everything that can now legitimately
+    // occupy the main engine in the background, one after another, when no
+    // helper model is armed: extraction (up to two 20s attempts), then
+    // self-critique (20s), then reasoning-trace distillation (20s) — all
+    // serialized through the same queue (see _backgroundCompletionChain),
+    // so they add up rather than overlap. Giving up before that queue can
+    // possibly drain would throw the exact "Another generation is already
+    // in progress" error this wait loop exists to avoid.
+    while (_llm.isGenerating.value && waitedMs < 90000) {
       await Future.delayed(const Duration(milliseconds: 100));
       waitedMs += 100;
     }
@@ -841,6 +890,17 @@ class ChatController extends GetxController {
       chat.updatedAt = DateTime.now();
       _storage.saveChat(chat);
       chats.refresh();
+
+      // Prefer the real, measured signal (per-token logit confidence)
+      // when the engine can report it — falls back to the surface-
+      // language heuristic only when it can't (older llamadart, no model
+      // loaded, nothing generated). See UncertaintyHeuristics' own doc for
+      // why the heuristic exists as a fallback at all.
+      final realConfidence = await _llm.getResponseConfidence();
+      final uncertainty = realConfidence != null
+          ? (1.0 - realConfidence).clamp(0.0, 1.0)
+          : UncertaintyHeuristics.hedgeScore(aiMsg.content);
+      aiMsg.telemetry?.setUncertainty(uncertainty, isHeuristic: realConfidence == null);
     }
 
     // Extraction runs after every non-trivial exchange (both the user's
@@ -860,27 +920,51 @@ class ChatController extends GetxController {
     // and distills what's durable, the same judgment call a human would
     // need to make when "that" doesn't name itself.
     //
-    // The broad `!looksTrivial` gate is only safe with a dedicated helper
+    // Running literally every turn is only safe with a dedicated helper
     // model loaded — it runs in its own engine, so it can't contend with the
     // main model's single generation slot. Without one, extraction falls
     // back to running ON the main model (see below), and firing that on
     // nearly every turn would mean the *next* message routinely waits out a
     // background generation before its own reply can even start — so
     // without a helper, stay on the tighter, trigger-worded `looksMemorable`
-    // gate instead.
+    // gate instead. With a helper armed, this skips nothing at all,
+    // including single-word turns — the explicit ask was that extraction
+    // must run every single cycle, not just non-trivial ones, so a real
+    // memorable fact volunteered right after a trivial acknowledgement is
+    // never the one turn that got skipped.
     final canExtractEveryTurn = _helper.isLoaded.value;
-    final worthExtracting = canExtractEveryTurn
-        ? !MemoryHeuristics.looksTrivial(trimmedText)
-        : MemoryHeuristics.looksMemorable(trimmedText);
-    if (_storage.persistentMemoryEnabled &&
-        _embedding.isLoaded.value &&
-        worthExtracting) {
-      unawaited(_extractAndRememberFromTurn(
-        userMsg,
-        aiMsg,
-        chat.id,
-        relevantMemoriesForTurn,
-      ));
+    final worthExtracting =
+        canExtractEveryTurn || MemoryHeuristics.looksMemorable(trimmedText);
+    if (_storage.persistentMemoryEnabled && _embedding.isLoaded.value) {
+      if (worthExtracting) {
+        unawaited(_extractAndRememberFromTurn(
+          userMsg,
+          aiMsg,
+          chat.id,
+          relevantMemoriesForTurn,
+        ));
+      } else {
+        _log?.info(
+          'Memory extraction skipped this turn: no helper model armed and '
+          'nothing matched the memorable-turn heuristic.',
+          source: 'Memory',
+        );
+      }
+    }
+
+    if (_storage.selfCritiqueEnabled) {
+      unawaited(_runSelfCritique(userMsg, aiMsg, relevantMemoriesForTurn));
+    }
+    if (_storage.reasoningTraceEnabled &&
+        aiMsg.reasoning != null &&
+        aiMsg.reasoning!.trim().isNotEmpty) {
+      unawaited(_distillReasoningTrace(aiMsg.reasoning!, chat.id));
+    }
+
+    final dueReminders = await _reminders.checkDue();
+    for (final reminder in dueReminders) {
+      _toast('Reminder: ${reminder.text}');
+      _log?.info('Reminder due: "${reminder.text}"', source: 'Reminders');
     }
   }
 
@@ -914,6 +998,17 @@ class ChatController extends GetxController {
         topK: _storage.topK,
         minP: _storage.minP,
         penalty: _storage.repeatPenalty,
+        // n-gram self-speculative: drafts from tokens already in this
+        // turn's own context, no second model involved — the backend
+        // verifies the draft in one batch and only keeps what the real
+        // model would have produced anyway, so output is identical either
+        // way; this only affects speed. Off by default until measured on
+        // a real device (see Settings > Hardware Configuration), same
+        // "don't trust a default that hasn't been benchmarked" principle
+        // as the GPU backend story.
+        speculativeDecodingConfig: _storage.speculativeDecodingEnabled
+            ? const SpeculativeDecodingConfig.ngramSimple()
+            : null,
       ),
       enableThinking: _storage.enableModelThinking,
       tools: tools,
@@ -964,6 +1059,308 @@ class ChatController extends GetxController {
     return toolCalls;
   }
 
+  /// A small, fixed set of exchanges with known-correct extraction outcomes
+  /// — including one negative case (nothing durable should be captured) —
+  /// run through the real extraction pipeline in dry-run mode (see
+  /// [_extractAndRememberFromTurn]'s `onDryRunResult`) so this tests what
+  /// actually runs on a real turn, not a separate reimplementation that
+  /// could silently drift from it. Nothing here writes to memory. Exists
+  /// because nothing else in the app measures whether extraction is
+  /// actually working — the log screen shows what happened on real turns,
+  /// but not whether the current helper model / extraction guidance is
+  /// any good at the job in the first place.
+  Future<({int passed, int total, List<({String description, bool passed, String actual})> details})>
+      runMemoryVerificationSuite() async {
+    final cases = <({String user, String ai, String description, bool Function(String) check})>[
+      (
+        user: 'My name is Jordan and I live in Denver.',
+        ai: 'Nice to meet you, Jordan! Denver is a great city.',
+        description: 'Captures a stated name',
+        check: (text) => text.toLowerCase().contains('jordan'),
+      ),
+      (
+        user: 'I prefer dark roast coffee over light roast.',
+        ai: 'Noted — dark roast it is.',
+        description: 'Captures a stated preference',
+        check: (text) =>
+            text.toLowerCase().contains('dark roast') || text.toLowerCase().contains('coffee'),
+      ),
+      (
+        user: "Remember that my dog's name is Biscuit.",
+        ai: 'Got it, Biscuit!',
+        description: 'Captures an explicit "remember that"',
+        check: (text) => text.toLowerCase().contains('biscuit'),
+      ),
+      (
+        user: 'I used to work at Acme Corp but now I work at Globex.',
+        ai: 'Congrats on the new job at Globex!',
+        description: 'Captures the current fact, not the outdated one',
+        check: (text) =>
+            text.toLowerCase().contains('globex') && !text.toLowerCase().contains('acme'),
+      ),
+      (
+        user: "What's 2+2?",
+        ai: '4.',
+        description: 'Correctly finds nothing durable (negative case)',
+        check: (text) => MemoryHeuristics.isNoMemorySentinel(text),
+      ),
+    ];
+
+    // Fail fast rather than burning the full timeout on every single case
+    // below — _extractAndRememberFromTurn itself bails out immediately
+    // (never calling onDryRunResult) when neither model is loaded, and
+    // that outcome is knowable up front here.
+    if (!_helper.isLoaded.value && !_llm.isLoaded.value) {
+      return (
+        passed: 0,
+        total: cases.length,
+        details: [
+          for (final c in cases)
+            (description: c.description, passed: false, actual: '(no model loaded)'),
+        ],
+      );
+    }
+
+    final details = <({String description, bool passed, String actual})>[];
+    for (final c in cases) {
+      final userMsg = MessageModel(role: MessageRole.user, content: c.user);
+      final aiMsg = MessageModel(role: MessageRole.assistant, content: c.ai);
+      String actual = '(no result)';
+      var passed = false;
+      final completer = Completer<void>();
+      unawaited(_extractAndRememberFromTurn(
+        userMsg,
+        aiMsg,
+        'verification',
+        const [],
+        onDryRunResult: (text, category, valence, confidence) {
+          actual = text.isEmpty ? '(empty)' : text;
+          passed = c.check(text);
+          if (!completer.isCompleted) completer.complete();
+        },
+      ));
+      // Must exceed extraction's real worst case, not just its per-attempt
+      // timeout: a malformed-JSON response triggers one retry (see the
+      // attempt loop above), so the live pipeline can legitimately take up
+      // to two attempts of (3s engine-slot wait + 20s generation) = 46s
+      // before onDryRunResult ever fires. Must clear that, not just match
+      // it — 45s was still 1s short and could false-negative a case the
+      // real pipeline would have gotten right on retry.
+      await completer.future.timeout(
+        const Duration(seconds: 50),
+        onTimeout: () => actual = '(timed out)',
+      );
+      details.add((description: c.description, passed: passed, actual: actual));
+    }
+
+    final passedCount = details.where((d) => d.passed).length;
+    _log?.info(
+      'Memory verification: $passedCount/${details.length} passed.',
+      source: 'Memory',
+    );
+    return (passed: passedCount, total: details.length, details: details);
+  }
+
+  /// Serializes calls to [_runBackgroundCompletion] — without this, two
+  /// independent background tasks (self-critique and reasoning-trace
+  /// distillation can both fire off the same turn) racing to fall back to
+  /// the single-slot main engine could both observe `isGenerating == false`
+  /// before either sets it, and the second one's `generateChatCompletion`
+  /// call throws a `StateError` instead of returning null like every other
+  /// failure mode here. Chaining through one Future guarantees only one
+  /// background completion — helper or main-fallback — runs at a time.
+  Future<void> _backgroundCompletionChain = Future.value();
+
+  /// Runs one short, bounded background generation — preferring the
+  /// dedicated helper engine when armed, falling back to the main model's
+  /// engine (waiting briefly for its generation slot, skipping rather than
+  /// blocking indefinitely if it stays busy) when not. This is the same
+  /// dual-engine fallback [_extractAndRememberFromTurn] uses for memory
+  /// extraction, factored out so other background tasks (self-critique,
+  /// reasoning-trace distillation) don't each reimplement the fallback,
+  /// timeout, and main-engine-stat-preservation logic. Returns null on any
+  /// failure — no model armed, busy too long, a timeout, or a race against
+  /// another caller (see [_backgroundCompletionChain]).
+  Future<String?> _runBackgroundCompletion(
+    List<LlamaChatMessage> messages, {
+    required int maxTokens,
+    double temp = 0.2,
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    final completer = Completer<String?>();
+    _backgroundCompletionChain = _backgroundCompletionChain.then((_) async {
+      try {
+        completer.complete(
+          await _runBackgroundCompletionInner(messages, maxTokens: maxTokens, temp: temp, timeout: timeout),
+        );
+      } catch (e) {
+        // A background task's failure must never propagate out of this
+        // serialization chain — that would poison every later queued call.
+        completer.complete(null);
+      }
+    });
+    return completer.future;
+  }
+
+  Future<String?> _runBackgroundCompletionInner(
+    List<LlamaChatMessage> messages, {
+    required int maxTokens,
+    double temp = 0.2,
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    final useHelper = _helper.isLoaded.value;
+    if (!useHelper && !_llm.isLoaded.value) return null;
+
+    if (useHelper) {
+      try {
+        return await _helper
+            .complete(messages, maxTokens: maxTokens, temp: temp)
+            .timeout(timeout);
+      } on TimeoutException {
+        _helper.stopGeneration();
+        return null;
+      }
+    }
+
+    var waitedMs = 0;
+    while (_llm.isGenerating.value && waitedMs < 3000) {
+      await Future.delayed(const Duration(milliseconds: 100));
+      waitedMs += 100;
+    }
+    if (_llm.isGenerating.value) return null;
+
+    // Reusing the main engine means its shared stats fields (read directly
+    // by chat_bubble.dart/home_screen.dart for the "t/s" readout on the
+    // user's actual last reply) would otherwise get silently overwritten
+    // with this background call's numbers — snapshot and restore them so
+    // the visible reply stats stay put.
+    final savedSpeed = _llm.lastGenerationSpeed.value;
+    final savedTokens = _llm.lastGenerationTokens.value;
+    final savedHitCap = _llm.lastGenerationHitTokenCap.value;
+
+    final buffer = StringBuffer();
+    try {
+      final stream = _llm
+          .generateChatCompletion(
+            messages: messages,
+            params: GenerationParams(temp: temp, maxTokens: maxTokens),
+            enableThinking: false,
+          )
+          .timeout(timeout);
+      await for (final chunk in stream) {
+        buffer.write(chunk.content);
+      }
+      return buffer.toString();
+    } on TimeoutException {
+      await _llm.stopGeneration();
+      return null;
+    } on StateError {
+      // The main engine started a real (non-background) generation in the
+      // narrow window between the isGenerating check above and this call —
+      // e.g. the user sent a new message right as this background task's
+      // turn came up in the serialization queue. Skip rather than crash.
+      return null;
+    } finally {
+      _llm.lastGenerationSpeed.value = savedSpeed;
+      _llm.lastGenerationTokens.value = savedTokens;
+      _llm.lastGenerationHitTokenCap.value = savedHitCap;
+    }
+  }
+
+  /// Second-opinion pass over an already-given answer: a bounded background
+  /// generation reads the exchange (plus whatever memories were already
+  /// retrieved for this turn, at no extra retrieval cost) and checks for a
+  /// direct contradiction with a remembered fact, or a confident-sounding
+  /// claim that isn't actually backed by anything in the exchange. This
+  /// never edits or blocks the answer already shown — it's purely
+  /// after-the-fact, surfaced as a soft note in the turn's telemetry (and a
+  /// toast if it found something), the evaluation loop this app never had
+  /// before. Best-effort and silent on failure, same as memory extraction.
+  Future<void> _runSelfCritique(
+    MessageModel userMsg,
+    MessageModel aiMsg,
+    List<MemoryEntry> relevantMemories,
+  ) async {
+    if (aiMsg.content.trim().isEmpty) return;
+    const maxChars = 600;
+    String cap(String s) => s.length > maxChars ? '${s.substring(0, maxChars)}…' : s;
+
+    final memoryContext = relevantMemories.isEmpty
+        ? ''
+        : '\n\nRemembered facts relevant to this exchange:\n'
+            '${relevantMemories.map((e) => '- ${cap(e.text)}').join('\n')}';
+
+    final request = <LlamaChatMessage>[
+      LlamaChatMessage.fromText(
+        role: LlamaChatRole.system,
+        text: 'You are reviewing an AI assistant\'s answer for two things '
+            'only: (1) does it directly contradict a remembered fact listed '
+            'below, and (2) does it state something as settled fact that '
+            'the exchange itself gives no real basis for (a confident '
+            'guess). Do not comment on style, tone, or anything else. If '
+            'neither problem is present, say so plainly.$memoryContext\n\n'
+            'Respond with ONLY a single-line JSON object, no other text: '
+            '{"flagged": <true|false>, "issue": "<one short sentence '
+            'describing the problem, or empty string if none>"}',
+      ),
+      LlamaChatMessage.fromText(role: LlamaChatRole.user, text: cap(userMsg.content)),
+      LlamaChatMessage.fromText(role: LlamaChatRole.assistant, text: cap(aiMsg.content)),
+    ];
+
+    final result = await _runBackgroundCompletion(request, maxTokens: 100);
+    if (result == null) return;
+
+    try {
+      final jsonStart = result.indexOf('{');
+      final jsonEnd = result.lastIndexOf('}');
+      if (jsonStart == -1 || jsonEnd == -1 || jsonEnd < jsonStart) return;
+      final decoded =
+          jsonDecode(result.substring(jsonStart, jsonEnd + 1)) as Map<String, dynamic>;
+      final flagged = decoded['flagged'] == true;
+      final issue = (decoded['issue'] as String? ?? '').trim();
+      aiMsg.telemetry?.setCritique(flagged: flagged, note: issue.isEmpty ? null : issue);
+      if (flagged && issue.isNotEmpty) {
+        _log?.warn('Self-critique flagged this answer: $issue', source: 'Critique');
+        _toast('Self-check: $issue');
+      } else {
+        _log?.info('Self-critique found no issue.', source: 'Critique');
+      }
+    } catch (_) {
+      // Malformed output from a small model — silently skip rather than
+      // showing a misleading or garbled note.
+    }
+  }
+
+  /// Distills [reasoning] (a turn's raw chain-of-thought) down to a short
+  /// gist and appends it to the reasoning-trace lane, separate from fact
+  /// memory — see ReasoningTraceService's own doc for why. Falls back to a
+  /// plain truncation (no model call) when neither engine is available,
+  /// same "works with or without a helper" principle as every other
+  /// background feature here — this lane keeps filling either way, just
+  /// with a cruder gist when nothing is armed to summarize it properly.
+  Future<void> _distillReasoningTrace(String reasoning, String chatId) async {
+    const rawCap = 1200;
+    final capped =
+        reasoning.length > rawCap ? '${reasoning.substring(0, rawCap)}…' : reasoning;
+
+    final request = <LlamaChatMessage>[
+      LlamaChatMessage.fromText(
+        role: LlamaChatRole.system,
+        text: 'Summarize the following reasoning in one short sentence — '
+            'the gist of the approach taken, not the full detail. Respond '
+            'with ONLY that one sentence, nothing else.',
+      ),
+      LlamaChatMessage.fromText(role: LlamaChatRole.user, text: capped),
+    ];
+
+    final result = await _runBackgroundCompletion(request, maxTokens: 60);
+    final summary = (result == null || result.trim().isEmpty)
+        ? (capped.length > 200 ? '${capped.substring(0, 200)}…' : capped)
+        : result.trim();
+
+    await _reasoningTraces.add(chatId, summary);
+  }
+
   /// Looks at the latest user+assistant exchange — already flagged as worth
   /// capturing by the gate in [sendMessage] (every non-trivial turn when a
   /// helper model is armed, or just [MemoryHeuristics.looksMemorable] turns
@@ -984,8 +1381,16 @@ class ChatController extends GetxController {
     MessageModel userMsg,
     MessageModel aiMsg,
     String chatId,
-    List<MemoryEntry> relevantMemories,
-  ) async {
+    List<MemoryEntry> relevantMemories, {
+    // When set, this runs the real extraction pipeline (prompt, generation,
+    // parsing) exactly as normal but stops before touching memory or the
+    // UI — the parsed result goes to this callback instead. Used by the
+    // verification harness ([runMemoryVerificationSuite]) so it tests the
+    // actual live pipeline, not a reimplementation of it that could drift
+    // out of sync with what real turns actually run.
+    void Function(String noteText, String category, String valence, double confidence)?
+        onDryRunResult,
+  }) async {
     try {
       final useHelper = _helper.isLoaded.value;
       if (!useHelper && !_llm.isLoaded.value) {
@@ -1077,7 +1482,10 @@ class ChatController extends GetxController {
               'general>", "valence": "<positive|negative|neutral>", '
               '"tags": ["<a few short keywords>"], "contradicts_index": '
               '<the number of the already-remembered item above that this '
-              'replaces/updates, or null if none>}',
+              'replaces/updates, or null if none>, "confidence": <0.0-1.0, '
+              'how sure you are this is actually true and durable — use a '
+              'low number for a guess or something ambiguous, a high '
+              'number only when it was stated plainly>}',
         ),
         LlamaChatMessage.fromText(role: LlamaChatRole.user, text: cap(userMsg.content)),
         LlamaChatMessage.fromText(role: LlamaChatRole.assistant, text: cap(aiMsg.content)),
@@ -1089,89 +1497,66 @@ class ChatController extends GetxController {
       ];
 
       String? extracted;
-      if (useHelper) {
-        // A dedicated, separate engine — no generation-slot contention with
-        // the main model or the Local API Server, so no wait loop needed.
-        // Still hard-timed out on general principle (any engine hanging on
-        // a background task should never run forever).
-        try {
-          extracted = await _helper
-              .complete(extractionRequest, maxTokens: extractionMaxTokens)
-              .timeout(const Duration(seconds: 20));
-        } on TimeoutException {
-          _helper.stopGeneration();
+      ({
+        String text,
+        String category,
+        String valence,
+        List<String> tags,
+        int? contradictsIndex,
+        double confidence,
+      })? parsed;
+
+      // Up to two attempts: a small quantized model producing malformed
+      // JSON is common enough that one retry meaningfully improves the hit
+      // rate, and this whole call is already bounded (20s timeout each)
+      // and only runs on turns already gated as worth extracting, so the
+      // extra attempt is bounded cost, not unbounded retrying.
+      for (var attempt = 0; attempt < 2; attempt++) {
+        // Routed through _runBackgroundCompletion (helper engine when
+        // armed, else the main engine's single slot) — the same
+        // serialization chain self-critique and reasoning-trace
+        // distillation use, so this can no longer race either of them for
+        // the main engine and throw an uncaught StateError. Previously
+        // this attempt loop hand-rolled its own copy of the exact same
+        // fallback/timeout/stat-preservation logic, independent of that
+        // chain — that duplication was itself the bug.
+        final attemptResult = await _runBackgroundCompletion(
+          extractionRequest,
+          maxTokens: extractionMaxTokens,
+        );
+
+        if (attemptResult == null) {
+          _log?.warn('Memory extraction returned nothing (timed out or empty).',
+              source: 'Memory');
           return;
         }
-      } else {
-        // No helper configured — fall back to the main model, which means
-        // waiting for its single generation slot and hard-capping how long
-        // this background task can occupy it.
-        var waitedMs = 0;
-        while (_llm.isGenerating.value && waitedMs < 3000) {
-          await Future.delayed(const Duration(milliseconds: 100));
-          waitedMs += 100;
+        extracted = attemptResult.trim();
+        parsed = _parseExtractionJson(extracted);
+        // A response that starts with '{' was clearly attempting JSON (the
+        // prompt asks for nothing else) — if full parsing still failed,
+        // it's a broken fragment, not a natural sentence, so it must never
+        // be stored verbatim (braces, quotes, field names and all) as if
+        // it were the memory itself. _parseExtractionJson already tries a
+        // regex-based partial recovery of just the "text" field for
+        // exactly this truncated-mid-object case; if even that comes back
+        // empty, retry once (small quantized models are inconsistent
+        // turn-to-turn), then give up.
+        final looksLikeBrokenJson = parsed == null && extracted.trimLeft().startsWith('{');
+        if (!looksLikeBrokenJson) break;
+        if (attempt == 0) {
+          _log?.warn('Memory extraction got malformed JSON, retrying once.',
+              source: 'Memory');
+          continue;
         }
-        if (_llm.isGenerating.value) return; // Still busy — skip this turn.
-
-        // This reuses the main engine, which means its shared stats fields
-        // (read directly by chat_bubble.dart/home_screen.dart for the "t/s"
-        // readout on the user's actual last reply) would otherwise get
-        // silently overwritten with this tiny background call's numbers —
-        // snapshot and restore them so the visible reply stats stay put.
-        final savedSpeed = _llm.lastGenerationSpeed.value;
-        final savedTokens = _llm.lastGenerationTokens.value;
-        final savedHitCap = _llm.lastGenerationHitTokenCap.value;
-
-        final buffer = StringBuffer();
-        try {
-          final stream = _llm
-              .generateChatCompletion(
-                messages: extractionRequest,
-                params: const GenerationParams(temp: 0.2, maxTokens: extractionMaxTokens),
-                enableThinking: false,
-              )
-              .timeout(const Duration(seconds: 20));
-          await for (final chunk in stream) {
-            buffer.write(chunk.content);
-          }
-          extracted = buffer.toString();
-        } on TimeoutException {
-          await _llm.stopGeneration();
-          return;
-        } finally {
-          _llm.lastGenerationSpeed.value = savedSpeed;
-          _llm.lastGenerationTokens.value = savedTokens;
-          _llm.lastGenerationHitTokenCap.value = savedHitCap;
-        }
-      }
-
-      if (extracted == null) {
-        _log?.warn('Memory extraction returned nothing (timed out or empty).',
-            source: 'Memory');
-        return;
-      }
-      extracted = extracted.trim();
-
-      final parsed = _parseExtractionJson(extracted);
-      // A response that starts with '{' was clearly attempting JSON (the
-      // prompt asks for nothing else) — if full parsing still failed, it's
-      // a broken fragment, not a natural sentence, so it must never be
-      // stored verbatim (braces, quotes, field names and all) as if it were
-      // the memory itself. _parseExtractionJson already tries a regex-based
-      // partial recovery of just the "text" field for exactly this
-      // truncated-mid-object case; if even that comes back empty, there's
-      // nothing safe to save from this turn.
-      final looksLikeBrokenJson = parsed == null && extracted.trimLeft().startsWith('{');
-      if (looksLikeBrokenJson) {
         _log?.warn(
-          'Memory extraction discarded: model produced malformed JSON: '
-          '${extracted.length > 200 ? '${extracted.substring(0, 200)}…' : extracted}',
+          'Memory extraction discarded after retry: model produced malformed '
+          'JSON: ${extracted.length > 200 ? '${extracted.substring(0, 200)}…' : extracted}',
           source: 'Memory',
         );
         return;
       }
 
-      final noteText = parsed?.text ?? extracted;
+      final noteText = parsed?.text ?? extracted ?? '';
       final category = parsed?.category ?? 'general';
       final valence = parsed?.valence ?? 'neutral';
       final tags = parsed?.tags ?? const <String>[];
@@ -1183,6 +1568,12 @@ class ChatController extends GetxController {
           (contradictsIndex != null && contradictsIndex >= 1 && contradictsIndex <= relevantMemories.length)
               ? relevantMemories[contradictsIndex - 1]
               : null;
+      final confidence = parsed?.confidence ?? 1.0;
+
+      if (onDryRunResult != null) {
+        onDryRunResult(noteText, category, valence, confidence);
+        return;
+      }
 
       // Whether JSON parsed or not, the "nothing durable" check still runs
       // on the actual candidate text — a malformed-JSON model that still
@@ -1203,29 +1594,53 @@ class ChatController extends GetxController {
         return;
       }
       if (contradictedMemory != null) {
-        // A correction must always create a fresh, superseding memory —
-        // never go through addIfNotDuplicate's near-duplicate check here.
-        // A corrected fact (e.g. "favorite color is green" replacing
-        // "...is blue") can easily stay above the duplicate-similarity
-        // threshold against the OLD entry it's meant to replace, since the
-        // two sentences are structurally almost identical — that would
+        // Never goes through addIfNotDuplicate's near-duplicate check — a
+        // corrected fact (e.g. "favorite color is green" replacing "...is
+        // blue") can easily stay above the duplicate-similarity threshold
+        // against the OLD entry it's meant to replace, since the two
+        // sentences are structurally almost identical, which would
         // silently reinforce the wrong (outdated) memory instead of
-        // recording the correction at all.
-        final newId = await _memory.add(
-          noteText,
-          vector,
-          sourceChatId: chatId,
+        // recording the correction at all. resolveContradiction itself now
+        // branches on confidence: a confident correction supersedes the
+        // old fact outright (the previous unconditional behavior here); a
+        // low-confidence one is kept alongside it instead, both active and
+        // tagged 'conflicting', until something resolves which is right.
+        final resolved = await _memory.resolveContradiction(
+          oldId: contradictedMemory.id,
+          newText: noteText,
+          newEmbedding: vector,
+          confidence: confidence,
           category: category,
           valence: valence,
           tags: tags,
+          sourceChatId: chatId,
         );
-        if (newId != null) {
-          await _memory.markSuperseded(contradictedMemory.id, newId);
-          _log?.info('Memory updated (superseded prior entry): "$noteText" ($category/$valence)',
-              source: 'Memory');
-          _toast('Memory updated: ${_truncateForToast(noteText)}');
-          aiMsg.telemetry?.setExtractedValence(category, valence);
+        if (!resolved) {
+          // The memory being corrected was deleted out from under this
+          // in-flight extraction (e.g. from the Memory screen) between
+          // when it was matched and when this awaited call landed —
+          // nothing to correct anymore, so say nothing succeeded.
+          _log?.warn(
+            'Memory correction discarded: the memory being corrected no '
+            'longer exists.',
+            source: 'Memory',
+          );
+          return;
         }
+        final confident = confidence >= MemoryService.confidentCorrectionThreshold;
+        _log?.info(
+          confident
+              ? 'Memory updated (superseded prior entry, confidence '
+                  '${confidence.toStringAsFixed(2)}): "$noteText" ($category/$valence)'
+              : 'Memory conflict recorded (low confidence '
+                  '${confidence.toStringAsFixed(2)}, both kept active): '
+                  '"$noteText" ($category/$valence)',
+          source: 'Memory',
+        );
+        _toast(confident
+            ? 'Memory updated: ${_truncateForToast(noteText)}'
+            : 'Possible conflict noted: ${_truncateForToast(noteText)}');
+        aiMsg.telemetry?.setExtractedValence(category, valence);
       } else {
         final result = await _memory.addIfNotDuplicate(
           noteText,
@@ -1234,6 +1649,13 @@ class ChatController extends GetxController {
           category: category,
           valence: valence,
           tags: tags,
+          confidence: confidence,
+          // Captured automatically, not something a human deliberately
+          // chose to save — starts on probation (see
+          // MemoryService.runWorkingMemoryMaintenance) and earns permanence
+          // by actually getting reinforced, rather than being permanent the
+          // instant it's written.
+          isWorkingMemory: true,
         );
         if (result.wasNew) {
           _log?.info('Memory saved: "$noteText" ($category/$valence)', source: 'Memory');
@@ -1268,7 +1690,14 @@ class ChatController extends GetxController {
   /// the caller can fall back to treating the raw text as a plain memory
   /// note — a small quantized model failing to format valid JSON should
   /// degrade gracefully, not lose the memory entirely.
-  ({String text, String category, String valence, List<String> tags, int? contradictsIndex})?
+  ({
+    String text,
+    String category,
+    String valence,
+    List<String> tags,
+    int? contradictsIndex,
+    double confidence,
+  })?
       _parseExtractionJson(String raw) {
     const validCategories = {'fact', 'preference', 'event', 'instruction', 'general'};
     const validValences = {'positive', 'negative', 'neutral'};
@@ -1297,6 +1726,25 @@ class ChatController extends GetxController {
           final contradictsIndex = contradictsRaw is num
               ? contradictsRaw.toInt()
               : int.tryParse(contradictsRaw?.toString() ?? '');
+          // Same leniency as above — a stringified "0.8" is as acceptable
+          // as a real number. Missing/unparseable defaults to 0.5, not
+          // 1.0: this is the same small-model class that produces
+          // malformed JSON often enough to need the retry loop above, so a
+          // dropped field reads as another symptom of imperfect output,
+          // not a real signal of certainty. Defaulting high would route a
+          // dropped-field contradiction straight into resolveContradiction's
+          // confident-supersede branch — permanently overwriting a
+          // correct memory on what might just be a formatting slip, which
+          // is exactly the case the confidence field exists to catch.
+          // Defaulting to the same 0.5 the truncated-fragment path below
+          // uses keeps both facts active and flagged instead — the safer
+          // failure mode when genuinely unsure which way it should go.
+          final confidenceRaw = decoded['confidence'];
+          final confidence = (confidenceRaw is num
+                  ? confidenceRaw.toDouble()
+                  : double.tryParse(confidenceRaw?.toString() ?? ''))
+              ?.clamp(0.0, 1.0) ??
+              0.5;
 
           return (
             text: text,
@@ -1304,6 +1752,7 @@ class ChatController extends GetxController {
             valence: validValences.contains(valenceRaw) ? valenceRaw! : 'neutral',
             tags: tags,
             contradictsIndex: contradictsIndex,
+            confidence: confidence,
           );
         }
       }
@@ -1326,6 +1775,11 @@ class ChatController extends GetxController {
       valence: 'neutral',
       tags: const [],
       contradictsIndex: null,
+      // Recovered from a truncated fragment, not a clean parse — treat as
+      // lower-confidence than a fully-formed response, since there's no
+      // way to know if the model would have hedged in the part that got
+      // cut off.
+      confidence: 0.5,
     );
   }
 
