@@ -9,6 +9,7 @@ import '../services/chat_storage_service.dart';
 import '../services/local_api_server_service.dart';
 import '../services/wakelock_service.dart';
 import '../services/log_service.dart';
+import '../services/memory_service.dart';
 import '../services/background_optimizer_service.dart';
 import '../routes/app_routes.dart';
 
@@ -36,6 +37,7 @@ class _SplashScreenState extends State<SplashScreen> {
       setState(() => _status = 'Setting up storage...');
       log.info('Initializing storage...', source: 'Splash');
       await Get.find<ChatStorageService>().init();
+      await Get.find<MemoryService>().init();
 
       setState(() => _status = 'Loading model catalog...');
       log.info('Loading model catalog...', source: 'Splash');

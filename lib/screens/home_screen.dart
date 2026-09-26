@@ -988,9 +988,83 @@ class _HomeScreenState extends State<HomeScreen> {
           }),
         ),
 
+        _buildRecalledMemoryChip(),
         _buildInputArea(),
       ],
     );
+  }
+
+  /// The "do I know this?" flash — a small, tappable pill that appears when
+  /// MemoryService matched something from earlier (this or another chat)
+  /// against the last message sent.
+  Widget _buildRecalledMemoryChip() {
+    return Obx(() {
+      final facts = _chatCtrl.recalledFacts;
+      if (facts.isEmpty) return const SizedBox.shrink();
+
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(20),
+            onTap: () => showDialog(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                backgroundColor: context.bgPanel,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                title: const Text('Remembered'),
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: facts
+                      .map(
+                        (f) => Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          child: Text('• ${f.text}'),
+                        ),
+                      )
+                      .toList(),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    child: const Text('Close'),
+                  ),
+                ],
+              ),
+            ),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: AppColors.accent.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: AppColors.accent.withValues(alpha: 0.3),
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('🧠', style: TextStyle(fontSize: 13)),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Remembered ${facts.length}',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: context.text,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    });
   }
 
   Widget _buildWelcome() {

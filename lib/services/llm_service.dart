@@ -395,6 +395,20 @@ class LlmService extends GetxService {
     }
   }
 
+  /// Embed [text] using the currently loaded model, if the active backend
+  /// supports it. Returns null (never throws) when no model is loaded, a
+  /// generation is in progress (embedding shares the context and would
+  /// contend with it), or the backend doesn't implement embeddings —
+  /// callers should fall back to a non-embedding recall strategy.
+  Future<List<double>?> embed(String text) async {
+    if (_engine == null || !isLoaded.value || isGenerating.value) return null;
+    try {
+      return await _engine!.embed(text);
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Stop ongoing generation.
   Future<void> stopGeneration() async {
     _generateSub?.cancel();

@@ -2,13 +2,16 @@ import 'dart:async';
 import 'package:get/get.dart';
 
 import '../models/chat_model.dart';
+import '../models/memory_fact.dart';
 import '../models/message_model.dart';
 import '../services/llm_service.dart';
 import '../services/chat_storage_service.dart';
+import '../services/memory_service.dart';
 
 class ChatController extends GetxController {
   final LlmService _llm = Get.find<LlmService>();
   final ChatStorageService _storage = Get.find<ChatStorageService>();
+  final MemoryService _memory = Get.find<MemoryService>();
 
   final chats = <ChatModel>[].obs;
   final activeChatId = RxnString();
@@ -16,6 +19,10 @@ class ChatController extends GetxController {
   final streamedResponse = ''.obs;
   final temperature = 0.7.obs;
   final systemPrompt = ''.obs;
+
+  /// Facts recalled for the in-flight/most recent turn — the "do I know
+  /// this?" signal. Empty when nothing in memory matched.
+  final recalledFacts = <MemoryFact>[].obs;
 
   StreamSubscription<String>? _genSub;
 
@@ -49,6 +56,7 @@ class ChatController extends GetxController {
     chats.insert(0, chat);
     _storage.saveChat(chat);
     activeChatId.value = chat.id;
+    recalledFacts.clear();
   }
 
   /// Switch to an existing chat.
@@ -58,6 +66,7 @@ class ChatController extends GetxController {
     if (chat != null) {
       systemPrompt.value = chat.systemPrompt;
     }
+    recalledFacts.clear();
   }
 
   /// Delete a chat.
@@ -95,6 +104,19 @@ class ChatController extends GetxController {
         .map((m) => m.toLlamaMessage())
         .toList();
 
+    // "Do I know this?" — check durable cross-chat memory before generating.
+    // A hit is injected as a short context block for THIS turn only; it is
+    // never written back into chat.systemPrompt.
+    recalledFacts.value = await _memory.recall(text);
+    final effectiveSystemPrompt = chat.systemPrompt.isNotEmpty
+        ? chat.systemPrompt
+        : systemPrompt.value;
+    final systemPromptForTurn = recalledFacts.isEmpty
+        ? effectiveSystemPrompt
+        : '$effectiveSystemPrompt\n\n'
+              'Relevant things you already know about this user:\n'
+              '${recalledFacts.map((f) => '- ${f.text}').join('\n')}';
+
     // Start generation
     isGenerating.value = true;
     streamedResponse.value = '';
@@ -103,26 +125,39 @@ class ChatController extends GetxController {
     chat.messages.add(aiMsg);
     chats.refresh();
 
+    // Throttle chats.refresh() during streaming — it invalidates every
+    // Obx listening on the reactive chat list, not just this one bubble.
+    // Flushing on a timer instead of every token keeps the UI responsive
+    // without paying a full reactive-list rebuild per token.
+    var pendingFlush = false;
+    Timer? flushTimer;
+    void scheduleFlush() {
+      if (pendingFlush) return;
+      pendingFlush = true;
+      flushTimer = Timer(const Duration(milliseconds: 60), () {
+        pendingFlush = false;
+        chats.refresh();
+      });
+    }
+
     try {
       final stream = _llm.generate(
         messages: history,
-        systemPrompt: chat.systemPrompt.isNotEmpty
-            ? chat.systemPrompt
-            : systemPrompt.value,
+        systemPrompt: systemPromptForTurn,
         temperature: temperature.value,
       );
 
       await for (final token in stream) {
         streamedResponse.value += token;
         aiMsg.content = streamedResponse.value;
-        // Throttle UI refreshes
-        chats.refresh();
+        scheduleFlush();
       }
     } catch (e) {
       if (aiMsg.content.isEmpty) {
         aiMsg.content = '⚠ Error: ${e.toString()}';
       }
     } finally {
+      flushTimer?.cancel();
       // Clean up any trailing stop tokens or whitespace
       aiMsg.content = aiMsg.content
           .replaceAll(RegExp(
@@ -136,6 +171,10 @@ class ChatController extends GetxController {
       chat.updatedAt = DateTime.now();
       _storage.saveChat(chat);
       chats.refresh();
+
+      // Cheap heuristic fact extraction from the user's message — no extra
+      // model call. Runs after the turn so it never adds latency to it.
+      unawaited(_memory.extractHeuristic(text, sourceChatId: chat.id));
     }
   }
 
