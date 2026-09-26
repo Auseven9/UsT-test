@@ -35,6 +35,71 @@ import 'reminder_service.dart';
 /// reasoning recall — grouped and toggled separately from memory since
 /// they're a different kind of capability (device/self access, not fact
 /// storage) with their own Settings switch.
+
+/// Bounds how many facts a single `remember_many` call can write — a
+/// deliberate, explicit model action (unlike background extraction, which
+/// has its own separate cap), but still bounded for the same reason every
+/// other batch write in this app is: each entry pays a real embed +
+/// dedupe-check cost, and there's no reason a single tool call should be
+/// able to write an unbounded number of memories.
+const _maxFactsPerToolCall = 5;
+
+const _validRememberCategories = {'fact', 'preference', 'event', 'instruction', 'general'};
+const _validRememberValences = {'positive', 'negative', 'neutral'};
+const _validRememberEntityTypes = {
+  'person', 'place', 'project', 'organization', 'event', 'idea', 'none',
+};
+
+/// Shared save path for both `remember` (one fact) and `remember_many`
+/// (several at once) — same validation, same probation tier, same
+/// near-duplicate handling either way, so a fact saved through the batch
+/// tool behaves identically to one saved through a single call.
+Future<Map<String, Object?>> _saveRememberedFact({
+  required MemoryService memory,
+  required EmbeddingService embedding,
+  required String text,
+  String? category,
+  String? valence,
+  String? entityName,
+  String? entityType,
+  String? location,
+  List<String>? participants,
+  String? connection,
+}) async {
+  final trimmedText = text.trim();
+  if (trimmedText.isEmpty) return {'error': 'text was empty — nothing saved.', 'saved': false};
+  final vector = await embedding.embed(trimmedText);
+  if (vector == null) {
+    return {'error': 'Embedding model unavailable — nothing saved.', 'saved': false};
+  }
+  final normalizedCategory = category?.toLowerCase();
+  final normalizedValence = valence?.toLowerCase();
+  final normalizedEntityType = entityType?.toLowerCase();
+  final result = await memory.addIfNotDuplicate(
+    trimmedText,
+    vector,
+    category: _validRememberCategories.contains(normalizedCategory) ? normalizedCategory! : 'general',
+    valence: _validRememberValences.contains(normalizedValence) ? normalizedValence! : 'neutral',
+    tags: const ['model-written'],
+    // Same probation period as automatic background extraction — the
+    // model deciding on its own something is worth saving mid-conversation
+    // isn't automatically more trustworthy than the background pass
+    // making the same call.
+    isWorkingMemory: true,
+    entityName: entityName?.trim() ?? '',
+    entityType: _validRememberEntityTypes.contains(normalizedEntityType) ? normalizedEntityType! : 'none',
+    location: location?.trim() ?? '',
+    participants: participants ?? const [],
+    connection: connection?.trim() ?? '',
+  );
+  return {
+    'text': trimmedText,
+    'saved': result.id != null,
+    'was_new': result.wasNew,
+    'was_reinforcement_of_existing': !result.wasNew && !result.wasEnriched,
+  };
+}
+
 List<ToolDefinition> buildToolDefinitions({
   required MemoryService memory,
   required EmbeddingService embedding,
@@ -275,41 +340,120 @@ List<ToolDefinition> buildToolDefinitions({
           ),
         ],
         handler: (params) async {
-          final text = params.getRequiredString('text').trim();
-          if (text.isEmpty) return {'error': 'text was empty — nothing saved.'};
-          final vector = await embedding.embed(text);
-          if (vector == null) {
-            return {'error': 'Embedding model unavailable — nothing saved.'};
-          }
-          const validCategories = {'fact', 'preference', 'event', 'instruction', 'general'};
-          const validValences = {'positive', 'negative', 'neutral'};
-          const validEntityTypes = {
-            'person', 'place', 'project', 'organization', 'event', 'idea', 'none',
-          };
-          final category = params.getString('category')?.toLowerCase();
-          final valence = params.getString('valence')?.toLowerCase();
-          final entityType = params.getString('entity_type')?.toLowerCase();
-          final result = await memory.addIfNotDuplicate(
-            text,
-            vector,
-            category: validCategories.contains(category) ? category! : 'general',
-            valence: validValences.contains(valence) ? valence! : 'neutral',
-            tags: const ['model-written'],
-            // Same probation period as automatic background extraction —
-            // the model deciding on its own something is worth saving mid-
-            // conversation isn't automatically more trustworthy than the
-            // background pass making the same call.
-            isWorkingMemory: true,
-            entityName: params.getString('entity_name')?.trim() ?? '',
-            entityType: validEntityTypes.contains(entityType) ? entityType! : 'none',
-            location: params.getString('location')?.trim() ?? '',
-            participants: params.getList<String>('participants') ?? const [],
-            connection: params.getString('connection')?.trim() ?? '',
+          return _saveRememberedFact(
+            memory: memory,
+            embedding: embedding,
+            text: params.getRequiredString('text'),
+            category: params.getString('category'),
+            valence: params.getString('valence'),
+            entityName: params.getString('entity_name'),
+            entityType: params.getString('entity_type'),
+            location: params.getString('location'),
+            participants: params.getList<String>('participants'),
+            connection: params.getString('connection'),
           );
+        },
+      ),
+      ToolDefinition(
+        name: 'remember_many',
+        description:
+            'Writes several distinct memories at once, in a single call — '
+            'use this instead of calling remember multiple times when one '
+            'message states several separate facts together (e.g. a name, '
+            'a location, and a project mentioned in the same breath). Each '
+            'entry is saved independently through the same path as '
+            'remember, including its own near-duplicate check. Up to '
+            '$_maxFactsPerToolCall facts per call.',
+        parameters: [
+          ToolParam.array(
+            'facts',
+            itemType: ToolParam.object(
+              'fact',
+              properties: [
+                ToolParam.string(
+                  'text',
+                  description: 'One short, self-contained sentence stating the fact.',
+                  required: true,
+                ),
+                ToolParam.string(
+                  'category',
+                  description: 'One of: fact, preference, event, instruction, general.',
+                  required: false,
+                ),
+                ToolParam.string(
+                  'valence',
+                  description: 'One of: positive, negative, neutral.',
+                  required: false,
+                ),
+                ToolParam.string(
+                  'entity_name',
+                  description: 'The one named person, place, project, or '
+                      'organization this entry is mainly about, if any.',
+                  required: false,
+                ),
+                ToolParam.string(
+                  'entity_type',
+                  description: 'One of: person, place, project, organization, '
+                      'event, idea, none.',
+                  required: false,
+                ),
+                ToolParam.string(
+                  'location',
+                  description: 'A place named in this entry, if any.',
+                  required: false,
+                ),
+                ToolParam.array(
+                  'participants',
+                  itemType: ToolParam.string('name'),
+                  description: 'Other people or entities named alongside '
+                      'entity_name, if any.',
+                  required: false,
+                ),
+                ToolParam.string(
+                  'connection',
+                  description: 'How entity_name relates to something else '
+                      'already known, in a few words, if stated.',
+                  required: false,
+                ),
+              ],
+            ),
+            description: 'The list of facts to save, one object per fact.',
+            required: true,
+          ),
+        ],
+        handler: (params) async {
+          // Fetched as Object? rather than getList<Map> — a typed cast list
+          // throws on the FIRST non-Map element it iterates to, discarding
+          // every fact in the call (including good ones before/after the
+          // bad element) on a single malformed entry from a small model.
+          // Checking each element's type in the loop instead lets one bad
+          // entry get skipped without losing the rest of the batch.
+          final rawFacts = params.getList<Object?>('facts') ?? const [];
+          if (rawFacts.isEmpty) return {'error': 'facts was empty — nothing saved.'};
+          final results = <Map<String, Object?>>[];
+          for (final raw in rawFacts.take(_maxFactsPerToolCall)) {
+            if (raw is! Map) {
+              results.add({'error': 'Skipped a non-object entry in facts.', 'saved': false});
+              continue;
+            }
+            final f = raw.cast<String, dynamic>();
+            String? str(String key) => (f[key] as Object?)?.toString();
+            results.add(await _saveRememberedFact(
+              memory: memory,
+              embedding: embedding,
+              text: str('text') ?? '',
+              category: str('category'),
+              valence: str('valence'),
+              entityName: str('entity_name'),
+              entityType: str('entity_type'),
+              location: str('location'),
+              participants: (f['participants'] as List?)?.map((e) => e.toString()).toList(),
+              connection: str('connection'),
+            ));
+          }
           return {
-            'saved': result.id != null,
-            'was_new': result.wasNew,
-            'was_reinforcement_of_existing': !result.wasNew && !result.wasEnriched,
+            'saved_count': results.where((r) => r['saved'] == true).length,
+            'results': results,
           };
         },
       ),

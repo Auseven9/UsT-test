@@ -21,6 +21,16 @@ extension ThemeExt on BuildContext {
 class AppColors {
   AppColors._();
 
+  /// Shared attention-score → chip color mapping, used identically by the
+  /// memory list and memory graph screens — kept in one place so a future
+  /// change to the thresholds/colors can't update one screen and miss the
+  /// other.
+  static Color forAttentionScore(double score, Color neutral) {
+    if (score >= 0.6) return green;
+    if (score <= 0.3) return neutral;
+    return orange;
+  }
+
   // ── Common Colors ──────────────────────────────────────────────
   static const accent    = Color(0xFF6366F1);
   static const accentDim = Color(0xFF4F46E5);

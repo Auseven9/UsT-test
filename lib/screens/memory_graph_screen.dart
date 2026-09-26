@@ -65,6 +65,23 @@ Map<String, Offset> _computeGraphLayout(List<MemoryEntry> entries) {
       }
     }
 
+    // A weak, constant pull toward the canvas center for every node,
+    // regardless of links. Pure pairwise repulsion has no opposing force
+    // for nodes that aren't linked to anything — with 3+ such nodes, they
+    // just keep pushing each other outward every iteration until they pile
+    // up at the clamped canvas edges/corners instead of settling into a
+    // legible cluster. This is the standard "gravity" term force-directed
+    // layouts (e.g. ForceAtlas2) use for exactly this case: small enough
+    // that real links and repulsion still dominate local structure, but
+    // enough to keep the whole graph compact and centered so every node
+    // stays within reach of the viewport instead of drifting off-screen.
+    const gravity = 0.02;
+    final center = Offset(_kGraphCanvasSize / 2, _kGraphCanvasSize / 2);
+    for (final e in entries) {
+      final toCenter = center - positions[e.id]!;
+      disp[e.id] = disp[e.id]! + toCenter * gravity;
+    }
+
     for (final e in entries) {
       final d = disp[e.id]!;
       final dist = d.distance.clamp(0.01, double.infinity);
@@ -150,28 +167,37 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
         _computingLayout = false;
       });
       // Without this, InteractiveViewer starts showing the canvas's raw
-      // (0,0) corner — since the force-directed layout settles the node
-      // cluster somewhere near the 1200x1200 canvas's own center rather
-      // than near (0,0), that left the whole graph sitting off to the
-      // lower right of a phone-sized viewport, needing a manual pan to
-      // even find it (and every tap landing on nothing, since there was
-      // nothing under the visible area). Centering the viewport on the
-      // actual node cluster's bounding-box centroid right after the FIRST
-      // layout fixes both, without later snapping a since-zoomed/panned
-      // view back out from under the user on every subsequent recompute.
+      // (0,0) corner at scale 1.0. Two problems compound here: the layout
+      // settles somewhere near the 1200x1200 canvas's own center rather
+      // than near (0,0), AND — the actual reason tapping/linking stopped
+      // working once there were 3+ memories — with more nodes, mutual
+      // repulsion spreads the cluster wider than a phone screen actually
+      // shows at scale 1.0, so the outer nodes render completely outside
+      // the visible viewport: not just requiring a pan to reach, but
+      // invisible and untappable until the user thinks to manually pinch-
+      // zoom out first. Fitting both the translation AND the scale to the
+      // real bounding box of the computed positions guarantees every node
+      // is on-screen and tappable immediately, at any memory count.
       if (!_hasCenteredView) {
-        // Only latch once centering actually ran — if the viewport still
-        // had zero size right at this moment (e.g. mid route-transition),
-        // _centerViewOn is a no-op, and setting the flag anyway would skip
-        // centering forever, permanently leaving the graph off-screen
-        // instead of catching it on the next layout recompute.
+        // Only latch once fitting actually ran — if the viewport still had
+        // zero size right at this moment (e.g. mid route-transition),
+        // _fitViewToPositions is a no-op, and setting the flag anyway would
+        // skip it forever, permanently leaving the graph off-screen instead
+        // of catching it on the next layout recompute.
         _hasCenteredView = result.isNotEmpty && viewportSize.width > 0 && viewportSize.height > 0;
-        _centerViewOn(result, viewportSize);
+        _fitViewToPositions(result, viewportSize);
       }
     });
   }
 
-  void _centerViewOn(Map<String, Offset> positions, Size viewportSize) {
+  /// Scales AND translates the view so every computed node position is
+  /// actually visible on-screen — not just centered at a fixed scale.
+  /// Centering alone (the previous fix) still left outer nodes off-screen
+  /// once 3+ largely-unlinked memories spread wider than a phone viewport
+  /// at scale 1.0: they existed, they just rendered outside the visible
+  /// area, which is indistinguishable from "can't tap the nodes" to
+  /// whoever's looking at the screen.
+  void _fitViewToPositions(Map<String, Offset> positions, Size viewportSize) {
     if (positions.isEmpty || viewportSize.width <= 0 || viewportSize.height <= 0) return;
     var minX = double.infinity, minY = double.infinity;
     var maxX = double.negativeInfinity, maxY = double.negativeInfinity;
@@ -182,13 +208,25 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
       maxY = max(maxY, p.dy);
     }
     final centroid = Offset((minX + maxX) / 2, (minY + maxY) / 2);
+    // Padding accounts for node radius/labels near the bounding box's own
+    // edge; a single node (zero-size box) would divide-by-zero below
+    // without the added margin, so pad the box by a fixed amount before
+    // ever computing a fit ratio from it.
+    const padding = 80.0;
+    final boxWidth = (maxX - minX) + padding * 2;
+    final boxHeight = (maxY - minY) + padding * 2;
+    final fitScale = min(viewportSize.width / boxWidth, viewportSize.height / boxHeight);
+    // Same [minScale, maxScale] the InteractiveViewer itself is built with
+    // below — clamped here too so a huge, sparse graph doesn't request a
+    // scale InteractiveViewer would just clamp anyway (leaving this
+    // computed transform and the widget's own idea of "current scale"
+    // disagreeing) and a single tiny node doesn't request a scale so large
+    // it defeats the point of fitting to begin with.
+    final scale = fitScale.clamp(0.2, 4.0);
     _viewController.value = Matrix4.identity()
-      ..translateByDouble(
-        viewportSize.width / 2 - centroid.dx,
-        viewportSize.height / 2 - centroid.dy,
-        0,
-        1,
-      );
+      ..translateByDouble(viewportSize.width / 2, viewportSize.height / 2, 0, 1)
+      ..scaleByDouble(scale, scale, 1, 1)
+      ..translateByDouble(-centroid.dx, -centroid.dy, 0, 1);
   }
 
   Color _categoryColor(String category) {
@@ -203,6 +241,12 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
         return AppColors.accentHi;
       case 'summary':
         return AppColors.accentDim;
+      case 'frame':
+        return AppColors.accentHi;
+      case 'insight':
+        return AppColors.green;
+      case 'tension':
+        return AppColors.red;
       default:
         return AppColors.accent;
     }
@@ -302,6 +346,12 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
                               : sheetContext.textM,
                     ),
                     if (!entry.isActive) _chip(sheetContext, 'superseded', AppColors.red),
+                    if (entry.lastReflectedAt != null)
+                      _chip(
+                        sheetContext,
+                        'attention ${(entry.attentionScore * 100).round()}%',
+                        AppColors.forAttentionScore(entry.attentionScore, sheetContext.textD),
+                      ),
                     for (final tag in entry.tags) _chip(sheetContext, tag, sheetContext.textD),
                   ],
                 ),

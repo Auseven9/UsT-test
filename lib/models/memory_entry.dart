@@ -137,6 +137,26 @@ class MemoryEntry {
   /// memories are linked, not why).
   final String connection;
 
+  /// How much the MAIN model itself currently values/attends to this
+  /// memory, 0.0–1.0, from the periodic attention-reflection pass (see
+  /// ChatController._runAttentionReflection) — distinct from [confidence]
+  /// (how sure extraction was this is TRUE) and [accessCount]/
+  /// [reinforcement] (how often it's been mechanically recalled). This is
+  /// the model's own stated sense of salience, closer to "how much this
+  /// matters to me" than "how often has this come up." Defaults to 0.5
+  /// (neutral) until the model has actually reflected on it at least once.
+  final double attentionScore;
+
+  /// The main model's own brief stated reason for [attentionScore] from the
+  /// most recent reflection pass — e.g. "central to an ongoing project",
+  /// or "a one-off detail that hasn't mattered since". Empty until the
+  /// model has reflected on this memory at least once.
+  final String attentionNote;
+
+  /// When the attention-reflection pass last considered this memory. Null
+  /// until it's been through at least one reflection cycle.
+  final DateTime? lastReflectedAt;
+
   const MemoryEntry({
     required this.id,
     required this.text,
@@ -161,6 +181,9 @@ class MemoryEntry {
     this.location = '',
     this.participants = const [],
     this.connection = '',
+    this.attentionScore = 0.5,
+    this.attentionNote = '',
+    this.lastReflectedAt,
   }) : lastAccessedAt = lastAccessedAt ?? createdAt;
 
   bool get isActive => supersededBy == null;
@@ -192,6 +215,9 @@ class MemoryEntry {
     String? location,
     List<String>? participants,
     String? connection,
+    double? attentionScore,
+    String? attentionNote,
+    DateTime? lastReflectedAt,
   }) {
     return MemoryEntry(
       id: id,
@@ -217,6 +243,9 @@ class MemoryEntry {
       location: location ?? this.location,
       participants: participants ?? this.participants,
       connection: connection ?? this.connection,
+      attentionScore: attentionScore ?? this.attentionScore,
+      attentionNote: attentionNote ?? this.attentionNote,
+      lastReflectedAt: lastReflectedAt ?? this.lastReflectedAt,
     );
   }
 
@@ -255,6 +284,11 @@ class MemoryEntry {
       participants:
           (json['participants'] as List?)?.map((e) => e as String).toList() ?? const [],
       connection: json['connection'] as String? ?? '',
+      attentionScore: (json['attentionScore'] as num?)?.toDouble() ?? 0.5,
+      attentionNote: json['attentionNote'] as String? ?? '',
+      lastReflectedAt: json['lastReflectedAt'] != null
+          ? DateTime.parse(json['lastReflectedAt'] as String)
+          : null,
     );
   }
 
@@ -282,5 +316,8 @@ class MemoryEntry {
         'location': location,
         'participants': participants,
         'connection': connection,
+        'attentionScore': attentionScore,
+        'attentionNote': attentionNote,
+        'lastReflectedAt': lastReflectedAt?.toIso8601String(),
       };
 }

@@ -15,6 +15,7 @@ import '../services/llm_service.dart';
 import '../services/chat_storage_service.dart';
 import '../services/embedding_service.dart';
 import '../services/helper_llm_service.dart';
+import '../services/model_manager.dart';
 import '../services/memory_service.dart';
 import '../services/memory_heuristics.dart';
 import '../services/reasoning_trace_service.dart';
@@ -38,11 +39,36 @@ const _maxResponseTokens = 2048;
 /// in more history than actually fits once the image is encoded.
 const _imageTokenReserve = 1024;
 
-/// Bounds how many tool-call ↔ tool-result round trips a single message can
-/// trigger before the app just gives up and returns whatever's happened so
-/// far — a model that keeps calling tools instead of answering shouldn't be
-/// able to turn one message into an unbounded battery/time sink on a phone.
-const _maxToolRounds = 3;
+
+/// Bounds how many distinct facts a single background-extraction pass can
+/// write from one exchange. Most turns genuinely have zero or one; this
+/// exists for the case a message states several separate facts at once
+/// ("I'm Jordan, I live in Denver, and I just started at Globex"), not to
+/// invite a verbose exchange to spawn a dozen low-value notes — each entry
+/// still goes through the same embed/dedupe/contradiction-check pipeline
+/// as a single extraction, so the real cost scales with this too.
+const _maxFactsPerExtraction = 3;
+
+/// How many memories go into each batch summary during Frame-building
+/// (see [ChatController._runFrameAnalysis]), and how many batches get
+/// built at most — bounds the pass to a fixed number of short generation
+/// calls regardless of how large the memory store has grown, rather than
+/// trying to fit "the entire store" into one prompt (which stops fitting
+/// in a 1-2K token context long before the store gets genuinely large).
+const _frameBatchSize = 8;
+const _maxFrameBatches = 6;
+
+/// How closely the main and helper model's independent interpretations of
+/// the same Frame need to agree (cosine similarity between their two
+/// interpretation embeddings) before the agreement is "hardened" into a
+/// new insight memory. Below this, the two are recorded as a flagged
+/// tension instead — see [ChatController._runFrameAnalysis]. Set lower
+/// than the consolidation/grounding thresholds elsewhere in this file:
+/// those compare a paraphrase against its own literal source text, while
+/// this compares two INDEPENDENTLY WRITTEN interpretations of the same
+/// material — real agreement between two different models naturally reads
+/// as more lexically distant than a single model paraphrasing itself.
+const _frameAgreementThreshold = 0.5;
 
 /// The judgment-call portion of the memory-extraction prompt — what counts
 /// as "worth remembering". Exposed (via [ChatStorageService.
@@ -150,10 +176,10 @@ class ChatController extends GetxController {
   /// setting so a new interval takes effect without an app restart.
   void _scheduleMemorySweep() {
     _memorySweepTimer?.cancel();
-    final minutes = _storage.memorySweepIntervalMinutes;
-    if (minutes <= 0) return;
+    final seconds = _storage.memorySweepIntervalSeconds;
+    if (seconds <= 0) return;
     _memorySweepTimer = Timer.periodic(
-      Duration(minutes: minutes),
+      Duration(seconds: seconds),
       (_) => _confirmAndRunMemorySweep(),
     );
   }
@@ -162,34 +188,65 @@ class ChatController extends GetxController {
   /// interval, instead of the new value only taking effect on next launch.
   void rescheduleMemorySweep() => _scheduleMemorySweep();
 
-  /// Asks the user before every sweep — the sweep now does a real probe
-  /// generation call (see [_runMemorySweep]), not just a flag check, so it's
-  /// no longer free enough to run silently on a timer without consent.
-  /// Declining just skips this cycle; the next tick asks again.
+  /// True from the moment a sweep cycle starts handling this tick — BEFORE
+  /// the consent dialog too, not just around the sweep's own work — until
+  /// it's fully done. With the interval now going down to 5 seconds, both
+  /// halves can easily outlast a single tick: the consent dialog waits up
+  /// to 20s for a response, and the sweep's own work (embedding probe,
+  /// consolidation up to 25s, attention reflection up to 30s+25s) can run
+  /// well past that too. Without guarding the whole span, Timer.periodic
+  /// fires several more times before the first tick finishes — either
+  /// stacking duplicate consent dialogs on top of each other, or piling up
+  /// concurrent embedding probes and an ever-growing backlog of main-engine
+  /// generations — instead of the one bounded cycle at a time this is
+  /// meant to be.
+  bool _sweepInFlight = false;
+
+  /// Runs (or asks first, per [ChatStorageService.sweepRequiresConfirmation])
+  /// every sweep cycle. With intervals down to 5 seconds, a per-cycle
+  /// confirmation dialog is the default-off path — this is meant to run as
+  /// a genuine background process, the same way the periodic per-turn
+  /// extraction and consolidation already do without asking each time.
+  /// Declining (when confirmation is on) just skips this cycle; the next
+  /// tick asks again.
   Future<void> _confirmAndRunMemorySweep() async {
-    // Never interrupt an in-progress reply with an uninvited dialog — skip
-    // this cycle silently rather than popping a barrier-blocking prompt
-    // over an actively streaming response. The next tick tries again.
-    if (isGenerating.value) {
-      _log?.info('Memory sweep skipped — a reply is in progress.', source: 'Memory');
+    if (_sweepInFlight) {
+      _log?.info('Memory sweep skipped — the previous cycle is still running.',
+          source: 'Memory');
       return;
     }
-    final accepted = await _askSweepConsent();
-    if (!accepted) {
-      _log?.info('Memory sweep declined for this cycle.', source: 'Memory');
-      return;
+    _sweepInFlight = true;
+    try {
+      // Never interrupt an in-progress reply — skip this cycle silently
+      // (whether or not confirmation is on) rather than contend with the
+      // main engine's single generation slot or pop a dialog over an
+      // actively streaming response. The next tick tries again.
+      if (isGenerating.value) {
+        _log?.info('Memory sweep skipped — a reply is in progress.', source: 'Memory');
+        return;
+      }
+      if (_storage.sweepRequiresConfirmation) {
+        final accepted = await _askSweepConsent();
+        if (!accepted) {
+          _log?.info('Memory sweep declined for this cycle.', source: 'Memory');
+          return;
+        }
+        // Re-check rather than trust the pre-dialog snapshot — up to 20s can
+        // pass while the consent dialog sits open, plenty of time for the
+        // user to have started (or resumed) a reply since the first check
+        // above.
+        if (isGenerating.value) {
+          _log?.info(
+            'Memory sweep skipped — a reply started while the consent dialog was open.',
+            source: 'Memory',
+          );
+          return;
+        }
+      }
+      await _runMemorySweep();
+    } finally {
+      _sweepInFlight = false;
     }
-    // Re-check rather than trust the pre-dialog snapshot — up to 20s can
-    // pass while the consent dialog sits open, plenty of time for the user
-    // to have started (or resumed) a reply since the first check above.
-    if (isGenerating.value) {
-      _log?.info(
-        'Memory sweep skipped — a reply started while the consent dialog was open.',
-        source: 'Memory',
-      );
-      return;
-    }
-    await _runMemorySweep();
   }
 
   Future<bool> _askSweepConsent() async {
@@ -333,6 +390,50 @@ class ChatController extends GetxController {
         );
       }
     }
+
+    // Cadence counter for the heavier attention-reflection pass below —
+    // counted regardless of whether this cycle found problems, so a run of
+    // unhealthy cycles doesn't also stall the "every N sweeps" clock.
+    final cycle = _storage.sweepCycleCount + 1;
+    _storage.sweepCycleCount = cycle;
+    final everyN = _storage.attentionReflectionEveryNSweeps;
+    if (problems.isEmpty &&
+        _storage.persistentMemoryEnabled &&
+        everyN > 0 &&
+        cycle % everyN == 0) {
+      // Re-check right before spinning up the main model — the health
+      // checks and consolidation above can themselves take a little while,
+      // plenty of time for the user to have started typing since the
+      // isGenerating guard at the top of _confirmAndRunMemorySweep.
+      if (isGenerating.value) {
+        _log?.info(
+          'Attention reflection skipped this cycle — a reply started '
+          'during the sweep.',
+          source: 'Memory',
+        );
+      } else {
+        await _runAttentionReflection();
+      }
+    }
+
+    // Independent cadence, same counter — Frame analysis is heavier still
+    // (a map-reduce summarization pass plus two full model generations), so
+    // it defaults to a rarer interval than attention reflection even though
+    // both are keyed off the same sweep-cycle count.
+    final frameEveryN = _storage.frameAnalysisEveryNSweeps;
+    if (problems.isEmpty &&
+        _storage.persistentMemoryEnabled &&
+        frameEveryN > 0 &&
+        cycle % frameEveryN == 0) {
+      if (isGenerating.value) {
+        _log?.info(
+          'Frame analysis skipped this cycle — a reply started during the sweep.',
+          source: 'Memory',
+        );
+      } else {
+        await _runFrameAnalysis();
+      }
+    }
   }
 
   /// Looks at a handful of the most recently-touched memories together and
@@ -420,6 +521,11 @@ class ChatController extends GetxController {
       return;
     }
     if (raw == null) return;
+    _log?.info(
+      'Memory consolidation exchange — shown notes:\n$listing\n'
+      'Model replied: $raw',
+      source: 'Memory',
+    );
     final parsed = _parseConsolidationJson(raw.trim());
     if (parsed == null) {
       _log?.warn('Memory consolidation discarded: malformed JSON.', source: 'Memory');
@@ -501,7 +607,7 @@ class ChatController extends GetxController {
   }
 
   /// Parses the consolidation prompt's `{"connection", "cites", "confidence"}`
-  /// JSON — same lenient-but-safe shape as [_parseExtractionJson], but with
+  /// JSON — same lenient-but-safe shape as [_parseExtractionFacts], but with
   /// no truncated-fragment fallback: an ungrounded free-text recovery would
   /// defeat the whole point of requiring citations, so a malformed response
   /// here is discarded outright rather than partially salvaged.
@@ -532,6 +638,508 @@ class ChatController extends GetxController {
       return (connection: connection, cites: cites, confidence: confidence);
     } catch (_) {
       return null;
+    }
+  }
+
+  /// The periodic "attention reflection" pass — distinct from per-turn
+  /// extraction (paraphrases real conversation) and consolidation (looks
+  /// for connections between notes). This spins up the MAIN model itself
+  /// to introspect on a sample of existing memories — not "is this true"
+  /// but "how much does this matter to me right now" — and then, if a
+  /// helper model is armed, has that SECOND model read the main model's
+  /// own words and condense them into a structured per-memory attention
+  /// score. Two real models genuinely exchanging turns, not one model
+  /// filling out a form: the main model's reflection is free text, in its
+  /// own words, and the helper model's job is only to listen and structure
+  /// what it said — it's never told what score to assign, just asked to
+  /// report back what the main model's reflection actually implied for
+  /// each numbered note.
+  ///
+  /// Runs far less often than the sweep it's piggybacked on (see
+  /// [ChatStorageService.attentionReflectionEveryNSweeps]) since it spends
+  /// a real main-model generation, not just a health check.
+  Future<void> _runAttentionReflection() async {
+    if (!_storage.persistentMemoryEnabled || !_llm.isLoaded.value) return;
+    final active = _memory.entries.where((e) => e.isActive).toList()
+      ..sort((a, b) => b.lastAccessedAt.compareTo(a.lastAccessedAt));
+    if (active.length < 2) return;
+
+    final sample = active.take(8).toList();
+    final listing = sample
+        .indexed
+        .map((e) => '${e.$1 + 1}. ${_capMemoryText(e.$2.text)}')
+        .join('\n');
+
+    _log?.info('Attention reflection starting — ${sample.length} notes sampled.',
+        source: 'Memory');
+
+    final reflectionRequest = <LlamaChatMessage>[
+      LlamaChatMessage.fromText(
+        role: LlamaChatRole.system,
+        text: 'Below are some things remembered about the person you\'ve '
+            'been talking with, and about your own past conduct. Reflect on '
+            'them honestly, in your own words: what do you actually '
+            'remember here, and which of these feel more important to keep '
+            'in mind going forward versus which feel minor or no longer '
+            'relevant? A couple of sentences per note you have something '
+            'real to say about is enough. This is a background reflection, '
+            'not a reply to the person, though it is recorded in the '
+            'app\'s log for the person to review, same as anything else '
+            'this reflection pass writes to memory.',
+      ),
+      LlamaChatMessage.fromText(role: LlamaChatRole.user, text: listing),
+    ];
+
+    final reflection = await _runOnMainEngine(reflectionRequest, maxTokens: 300, temp: 0.6);
+    if (reflection == null || reflection.trim().isEmpty) {
+      _log?.info('Attention reflection: main model gave nothing usable.', source: 'Memory');
+      return;
+    }
+    _log?.info(
+      'Attention reflection exchange — shown notes:\n$listing\n'
+      'Main model reflected: ${_cap(reflection, 400)}',
+      source: 'Memory',
+    );
+
+    // Structuring the main model's free-text reflection into per-note
+    // scores needs a second model actually reading and reporting on what
+    // the first one said — routing this through the helper specifically
+    // (never falling back to the main model again) keeps it an honest
+    // second opinion rather than the same model grading its own homework
+    // through a different prompt.
+    if (!_helper.isLoaded.value) {
+      _log?.info(
+        'Attention reflection: no helper model armed, so the reflection '
+        'above was logged but not converted into per-memory scores.',
+        source: 'Memory',
+      );
+      return;
+    }
+    if (_helper.isBusy) {
+      _log?.info(
+        'Attention reflection: helper model busy, skipping structuring this cycle.',
+        source: 'Memory',
+      );
+      return;
+    }
+
+    final structuringRequest = <LlamaChatMessage>[
+      LlamaChatMessage.fromText(
+        role: LlamaChatRole.system,
+        text: 'Another model was shown these numbered notes and gave a '
+            'free-form reflection on them. Read its reflection and report, '
+            'for each note it actually said something substantive about, '
+            'how important that reflection made it sound (0.0 = it sounded '
+            'minor/irrelevant, 1.0 = it sounded important to keep in mind), '
+            'plus a short clause capturing what it said. Do not add '
+            'judgments of your own — only report what the reflection '
+            'itself implied. Skip any note the reflection didn\'t really '
+            'address. Respond with ONLY a single-line JSON array, no other '
+            'text: [{"index": <note number>, "attention": <0.0-1.0>, '
+            '"note": "<short clause from the reflection>"}, ...] — or []'
+            'if the reflection didn\'t substantively address any of them.',
+      ),
+      LlamaChatMessage.fromText(
+        role: LlamaChatRole.user,
+        text: 'Notes:\n$listing\n\nThe other model\'s reflection:\n$reflection',
+      ),
+    ];
+
+    String? structuredRaw;
+    try {
+      structuredRaw = await _helper
+          .complete(structuringRequest, maxTokens: 220)
+          .timeout(const Duration(seconds: 25));
+    } on TimeoutException {
+      _helper.stopGeneration();
+      _log?.warn('Attention reflection: helper structuring timed out.', source: 'Memory');
+      return;
+    }
+    if (structuredRaw == null) return;
+    _log?.info(
+      'Attention reflection exchange — helper model asked to structure the '
+      'main model\'s reflection above, replied: ${_cap(structuredRaw, 400)}',
+      source: 'Memory',
+    );
+
+    final parsed = _parseAttentionJson(structuredRaw.trim());
+    if (parsed == null || parsed.isEmpty) {
+      _log?.info(
+        'Attention reflection: nothing structured from the helper\'s reply.',
+        source: 'Memory',
+      );
+      return;
+    }
+
+    final updates = <({String id, double attention, String note})>[];
+    for (final item in parsed) {
+      if (item.index < 1 || item.index > sample.length) continue;
+      updates.add((
+        id: sample[item.index - 1].id,
+        attention: item.attention,
+        note: item.note,
+      ));
+    }
+    if (updates.isEmpty) return;
+    await _memory.applyAttentionReflection(updates);
+    _log?.info(
+      'Attention reflection applied: updated ${updates.length} '
+      'memor${updates.length == 1 ? 'y' : 'ies'} with a fresh attention score.',
+      source: 'Memory',
+    );
+  }
+
+  /// Parses the attention-structuring prompt's JSON array response. Same
+  /// lenient shape as the other memory-pipeline parsers — returns null on
+  /// anything unparseable rather than throwing, since this is a soft
+  /// signal, not a correctness-critical write.
+  List<({int index, double attention, String note})>? _parseAttentionJson(String raw) {
+    try {
+      final start = raw.indexOf('[');
+      final end = raw.lastIndexOf(']');
+      if (start == -1 || end == -1 || end <= start) return null;
+      final decoded = jsonDecode(raw.substring(start, end + 1));
+      if (decoded is! List) return null;
+      final result = <({int index, double attention, String note})>[];
+      for (final item in decoded) {
+        if (item is! Map) continue;
+        final indexRaw = item['index'];
+        final index = indexRaw is num ? indexRaw.toInt() : int.tryParse(indexRaw?.toString() ?? '');
+        if (index == null) continue;
+        final attentionRaw = item['attention'];
+        final attention = (attentionRaw is num
+                    ? attentionRaw.toDouble()
+                    : double.tryParse(attentionRaw?.toString() ?? ''))
+                ?.clamp(0.0, 1.0) ??
+            0.5;
+        final note = (item['note'] as Object?)?.toString().trim() ?? '';
+        result.add((index: index, attention: attention, note: note));
+      }
+      return result;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Builds a single "Frame" — a bounded, hierarchical summary standing in
+  /// for the whole memory store (map-reduce: summarize batches, then
+  /// summarize the batch summaries into one paragraph, since the real
+  /// store can't fit in a 1-2K token context once it grows past a few
+  /// dozen entries) — then has BOTH the main and helper model
+  /// independently interpret that same Frame with the SAME instructions,
+  /// looking for the deeper pattern behind how everything connects. Where
+  /// the two interpretations actually agree (by embedding similarity, not
+  /// exact wording), that agreement is hardened into a new "insight"
+  /// memory. Where they don't agree, BOTH interpretations are kept, tagged
+  /// as an unresolved "tension" — surfaced via toast and logged explicitly,
+  /// then left in the ordinary memory browser for the user to review, fix,
+  /// or discard, rather than the app silently picking one model's opinion.
+  Future<void> _runFrameAnalysis() async {
+    if (!_storage.persistentMemoryEnabled || !_llm.isLoaded.value || !_helper.isLoaded.value) {
+      return;
+    }
+    if (_helper.isBusy) {
+      _log?.info('Frame analysis skipped — helper model busy.', source: 'Memory');
+      return;
+    }
+
+    // Frame/insight/tension entries from a PRIOR pass are themselves
+    // memories — excluded here so a Frame doesn't end up summarizing
+    // itself or last cycle's insights/tensions instead of the actual
+    // source material.
+    final active = _memory.entries
+        .where((e) =>
+            e.isActive &&
+            e.category != 'frame' &&
+            e.category != 'insight' &&
+            e.category != 'tension')
+        .toList()
+      ..sort((a, b) => b.lastAccessedAt.compareTo(a.lastAccessedAt));
+    if (active.length < _frameBatchSize) {
+      _log?.info(
+        'Frame analysis skipped — not enough memories yet (${active.length}, '
+        'need at least $_frameBatchSize).',
+        source: 'Memory',
+      );
+      return;
+    }
+
+    final sample = active.take(_frameBatchSize * _maxFrameBatches).toList();
+    final batches = <List<MemoryEntry>>[];
+    for (var i = 0; i < sample.length; i += _frameBatchSize) {
+      batches.add(sample.sublist(i, min(i + _frameBatchSize, sample.length)));
+    }
+    _log?.info(
+      'Frame analysis starting — ${sample.length} memories in ${batches.length} batches.',
+      source: 'Memory',
+    );
+
+    // MAP: one cheap helper-model summary per batch.
+    final batchSummaries = <String>[];
+    for (final batch in batches) {
+      final listing = batch.map((e) => '- ${_capMemoryText(e.text)}').join('\n');
+      final request = <LlamaChatMessage>[
+        LlamaChatMessage.fromText(
+          role: LlamaChatRole.system,
+          text: 'Summarize the common thread across these remembered notes '
+              'in one short sentence. Only state what they actually say — '
+              'never invent anything not present in them.',
+        ),
+        LlamaChatMessage.fromText(role: LlamaChatRole.user, text: listing),
+      ];
+      String? batchSummary;
+      try {
+        batchSummary =
+            await _helper.complete(request, maxTokens: 60).timeout(const Duration(seconds: 25));
+      } on TimeoutException {
+        _helper.stopGeneration();
+      }
+      if (batchSummary == null || batchSummary.trim().isEmpty) continue;
+      batchSummary = batchSummary.trim();
+      _log?.info(
+        'Frame batch exchange — shown:\n$listing\nHelper model summarized: $batchSummary',
+        source: 'Memory',
+      );
+      batchSummaries.add(batchSummary);
+    }
+    if (batchSummaries.isEmpty) {
+      _log?.warn('Frame analysis: no batch summaries produced, aborting.', source: 'Memory');
+      return;
+    }
+
+    // REDUCE: the main model synthesizes the batch summaries (not the raw
+    // memories — already bounded and short) into one Frame paragraph.
+    final reduceRequest = <LlamaChatMessage>[
+      LlamaChatMessage.fromText(
+        role: LlamaChatRole.system,
+        text: 'Below are several short summaries, each covering a different '
+            'slice of everything currently remembered about the person '
+            'you\'ve been talking with. Write ONE short paragraph (2-4 '
+            'sentences) capturing what the memory store as a whole is '
+            'actually about right now — the throughline connecting these '
+            'pieces, not just a list of them. Only state what these '
+            'summaries actually say; do not invent detail beyond them.',
+      ),
+      LlamaChatMessage.fromText(
+        role: LlamaChatRole.user,
+        text: batchSummaries.indexed.map((e) => '${e.$1 + 1}. ${e.$2}').join('\n'),
+      ),
+    ];
+    final frameText = await _runOnMainEngine(
+      reduceRequest,
+      maxTokens: 200,
+      temp: 0.4,
+      timeout: const Duration(seconds: 30),
+    );
+    if (frameText == null || frameText.trim().isEmpty) {
+      _log?.warn('Frame analysis: main model produced nothing for the Frame summary.',
+          source: 'Memory');
+      return;
+    }
+    final frame = frameText.trim();
+    _log?.info(
+      'Frame analysis exchange — batch summaries:\n${batchSummaries.join('\n')}\n'
+      'Main model synthesized the Frame: $frame',
+      source: 'Memory',
+    );
+
+    final frameVector = await _embedding.embed(frame);
+    if (frameVector == null) {
+      _log?.warn('Frame analysis discarded: embedding failed for the Frame text.',
+          source: 'Memory');
+      return;
+    }
+
+    // Exactly one active Frame at a time — a fresh one supersedes whatever
+    // stood in for the store last cycle, same "never delete, just
+    // supersede" discipline as every other correction in this app.
+    MemoryEntry? previousFrame;
+    for (final e in _memory.entries) {
+      if (e.isActive && e.category == 'frame') {
+        previousFrame = e;
+        break;
+      }
+    }
+    final frameId = await _memory.add(
+      frame,
+      frameVector,
+      category: 'frame',
+      valence: 'neutral',
+      tags: const ['frame'],
+    );
+    if (frameId == null) {
+      _log?.warn('Frame analysis: could not store the Frame.', source: 'Memory');
+      return;
+    }
+    if (previousFrame != null) {
+      await _memory.markSuperseded(previousFrame.id, frameId);
+    }
+
+    // The Frame is meant to be a real hub, not just something that
+    // happens to score close in embedding space — link it explicitly to
+    // (a bounded sample of) the actual source memories it was built from.
+    // One batched write for all of them, not one disk write per link —
+    // this whole pass exists to summarize a store too large to fit in
+    // context, so linking its sources back to it is exactly the wrong
+    // place to pay a full-store serialize+write per pair.
+    await _memory.linkManyToHub(frameId, sample.take(12).map((e) => e.id));
+
+    // Both models get the exact same instructions and the exact same
+    // Frame text — an independent second opinion, not a leading question.
+    const interpretationInstruction =
+        'Below is "the Frame" — a snapshot summarizing everything currently '
+        'remembered. Look past the surface content and describe, in your '
+        'own words, the deeper pattern or meaning connecting these things '
+        '— not just what they say, but what they suggest together. A '
+        'short paragraph is enough.';
+    final interpretRequest = <LlamaChatMessage>[
+      LlamaChatMessage.fromText(role: LlamaChatRole.system, text: interpretationInstruction),
+      LlamaChatMessage.fromText(role: LlamaChatRole.user, text: frame),
+    ];
+
+    final mainInterpretation = await _runOnMainEngine(
+      interpretRequest,
+      maxTokens: 200,
+      temp: 0.6,
+      timeout: const Duration(seconds: 30),
+    );
+    if (mainInterpretation == null || mainInterpretation.trim().isEmpty) {
+      _log?.info('Frame analysis: main model gave no interpretation.', source: 'Memory');
+      return;
+    }
+    _log?.info(
+      'Frame analysis exchange — Frame shown to main model: $frame\n'
+      'Main model interpreted: $mainInterpretation',
+      source: 'Memory',
+    );
+
+    // Second opinion: either the always-loaded helper (the original
+    // behavior), or — if a rotation model is configured — a spare
+    // downloaded model that takes alternating turns instead, loaded only
+    // for this one generation and torn down immediately after. Alternation
+    // is tracked regardless of whether this attempt actually succeeds, so
+    // a transient load failure doesn't stall the rotation on one model
+    // forever.
+    final rotationFilename = _storage.secondOpinionModelFilename;
+    final useRotationThisCycle =
+        rotationFilename.isNotEmpty && _storage.frameUsesSecondOpinionNextCycle;
+    if (rotationFilename.isNotEmpty) {
+      _storage.frameUsesSecondOpinionNextCycle = !_storage.frameUsesSecondOpinionNextCycle;
+    }
+
+    String? secondOpinionText;
+    String secondOpinionLabel = _storage.helperModelFilename.isEmpty
+        ? 'the helper (falling back to the main model)'
+        : 'the helper model (${_storage.helperModelFilename})';
+
+    if (useRotationThisCycle) {
+      final rotationEngine = Get.find<HelperLlmService>(tag: 'secondOpinion');
+      try {
+        final path = Get.find<ModelManager>().getModelPathByFilename(rotationFilename);
+        await rotationEngine.loadModel(path);
+      } catch (e) {
+        _log?.warn(
+          'Frame analysis: could not load rotation model "$rotationFilename" '
+          '($e) — falling back to the regular helper for this cycle.',
+          source: 'Memory',
+        );
+      }
+      if (rotationEngine.isLoaded.value) {
+        try {
+          secondOpinionText = await rotationEngine
+              .complete(interpretRequest, maxTokens: 200)
+              .timeout(const Duration(seconds: 30));
+        } on TimeoutException {
+          rotationEngine.stopGeneration();
+        }
+        // Torn down immediately either way — this model's turn is over,
+        // and it was never meant to stay resident alongside the main and
+        // helper models any longer than the one generation it was loaded
+        // for.
+        await rotationEngine.unloadModel();
+        secondOpinionLabel = '$rotationFilename (rotation)';
+      }
+    }
+
+    if (secondOpinionText == null || secondOpinionText.trim().isEmpty) {
+      if (_helper.isBusy) {
+        _log?.info(
+          'Frame analysis: helper model busy — main model\'s interpretation '
+          'logged above, but no second opinion this cycle.',
+          source: 'Memory',
+        );
+        return;
+      }
+      try {
+        secondOpinionText = await _helper
+            .complete(interpretRequest, maxTokens: 200)
+            .timeout(const Duration(seconds: 25));
+      } on TimeoutException {
+        _helper.stopGeneration();
+      }
+      secondOpinionLabel = _storage.helperModelFilename.isEmpty
+          ? 'the helper (falling back to the main model)'
+          : 'the helper model (${_storage.helperModelFilename})';
+    }
+    if (secondOpinionText == null || secondOpinionText.trim().isEmpty) {
+      _log?.info('Frame analysis: second opinion gave nothing usable.', source: 'Memory');
+      return;
+    }
+    final helperInterpretation = secondOpinionText;
+    _log?.info(
+      'Frame analysis exchange — the exact same Frame and instructions shown '
+      'to $secondOpinionLabel: $frame\nIt interpreted: $helperInterpretation',
+      source: 'Memory',
+    );
+
+    final mainVec = await _embedding.embed(mainInterpretation.trim());
+    final helperVec = await _embedding.embed(helperInterpretation.trim());
+    if (mainVec == null || helperVec == null) {
+      _log?.warn('Frame analysis: embedding failed for one or both interpretations.',
+          source: 'Memory');
+      return;
+    }
+    final agreement = _memory.cosineSimilarity(mainVec, helperVec);
+
+    if (agreement >= _frameAgreementThreshold) {
+      final insightId = await _memory.add(
+        mainInterpretation.trim(),
+        mainVec,
+        category: 'insight',
+        valence: 'neutral',
+        tags: const ['insight', 'frame-derived'],
+        confidence: agreement,
+      );
+      if (insightId != null) await _memory.linkManually(frameId, insightId);
+      _log?.info(
+        'Frame analysis: both models agreed (similarity '
+        '${agreement.toStringAsFixed(2)}) — hardened as a new insight: '
+        '"${mainInterpretation.trim()}"',
+        source: 'Memory',
+      );
+      _toast('Frame analysis: models agreed — new insight recorded.');
+    } else {
+      final tensionText =
+          'Models disagreed interpreting the Frame — one said: '
+          '"${mainInterpretation.trim()}" — the other said: '
+          '"${helperInterpretation.trim()}"';
+      final tensionVec = await _embedding.embed(tensionText) ?? mainVec;
+      final tensionId = await _memory.add(
+        tensionText,
+        tensionVec,
+        category: 'tension',
+        valence: 'neutral',
+        tags: const ['unresolved', 'tension'],
+        confidence: agreement,
+      );
+      if (tensionId != null) await _memory.linkManually(frameId, tensionId);
+      _log?.warn(
+        'Frame analysis: unresolved tension flagged (similarity '
+        '${agreement.toStringAsFixed(2)}, below the $_frameAgreementThreshold '
+        'agreement threshold) — $tensionText',
+        source: 'Memory',
+      );
+      _toast('Frame analysis: models disagreed — flagged for your review.');
     }
   }
 
@@ -798,8 +1406,11 @@ class ChatController extends GetxController {
     final pendingRoundSeparator = [false, false];
     var exhaustedRounds = false;
 
+    final maxToolRounds =
+        _storage.maxToolRounds.clamp(1, ChatStorageService.defaultMaxToolRounds * 10);
+
     try {
-      for (var round = 0; round < _maxToolRounds; round++) {
+      for (var round = 0; round < maxToolRounds; round++) {
         if (round > 0) {
           // Tool results were just appended to roundMessages — re-fit
           // against the context budget again, since those extra messages
@@ -814,7 +1425,7 @@ class ChatController extends GetxController {
           responseBudget = refit.responseBudget.clamp(1, _maxResponseTokens);
           aiMsg.telemetry?.setContextUsage(refit.historyTokens, refit.contextSize);
         }
-        exhaustedRounds = round == _maxToolRounds - 1;
+        exhaustedRounds = round == maxToolRounds - 1;
 
         final toolCalls = await _streamGeneration(
           messages: roundMessages,
@@ -1328,6 +1939,24 @@ class ChatController extends GetxController {
       }
     }
 
+    return _completeOnMainEngine(messages, maxTokens: maxTokens, temp: temp, timeout: timeout);
+  }
+
+  /// The actual "run a background completion on the main engine" logic,
+  /// factored out of [_runBackgroundCompletionInner]'s fallback branch so
+  /// [_runAttentionReflection] can also reach the main engine directly —
+  /// that pass specifically needs the main model's own voice, not whichever
+  /// engine [_runBackgroundCompletion]'s helper-first routing happens to
+  /// pick. Callers must already hold a turn in [_backgroundCompletionChain]
+  /// (this does not itself serialize) since it touches the single-slot main
+  /// engine's shared stats fields.
+  Future<String?> _completeOnMainEngine(
+    List<LlamaChatMessage> messages, {
+    required int maxTokens,
+    double temp = 0.2,
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    if (!_llm.isLoaded.value) return null;
     var waitedMs = 0;
     while (_llm.isGenerating.value && waitedMs < 3000) {
       await Future.delayed(const Duration(milliseconds: 100));
@@ -1371,6 +2000,31 @@ class ChatController extends GetxController {
       _llm.lastGenerationTokens.value = savedTokens;
       _llm.lastGenerationHitTokenCap.value = savedHitCap;
     }
+  }
+
+  /// Same serialization contract as [_runBackgroundCompletion] (queued
+  /// through [_backgroundCompletionChain] so it can't race self-critique/
+  /// reasoning-trace/extraction for the main engine's single slot) but
+  /// always targets the main model specifically, never the helper — for
+  /// [_runAttentionReflection], which needs the main model's own voice, not
+  /// whichever engine happens to be armed.
+  Future<String?> _runOnMainEngine(
+    List<LlamaChatMessage> messages, {
+    required int maxTokens,
+    double temp = 0.4,
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    final completer = Completer<String?>();
+    _backgroundCompletionChain = _backgroundCompletionChain.then((_) async {
+      try {
+        completer.complete(
+          await _completeOnMainEngine(messages, maxTokens: maxTokens, temp: temp, timeout: timeout),
+        );
+      } catch (e) {
+        completer.complete(null);
+      }
+    });
+    return completer.future;
   }
 
   /// Second-opinion pass over an already-given answer: a bounded background
@@ -1514,11 +2168,13 @@ class ChatController extends GetxController {
       );
 
       // A bit more room than a one-sentence extraction needed, to fit the
-      // JSON structure below — bumped from 130 when entity_name/entity_type/
-      // location/participants/connection were added alongside the original
-      // text/category/valence/tags fields, since that's meaningfully more
-      // JSON for the same token budget to cover.
-      const extractionMaxTokens = 220;
+      // JSON structure below — bumped again (220 -> 480) now that the
+      // response is an array of up to _maxFactsPerExtraction objects
+      // instead of always exactly one; a genuinely fact-dense exchange
+      // ("My name's Jordan, I live in Denver, and I just started at
+      // Globex") can now come back as three separate notes in one pass
+      // instead of the model having to pick just one of them.
+      const extractionMaxTokens = 480;
 
       // A long exchange (a big assistant reply is exactly the case most
       // likely to actually contain something worth remembering) can exceed
@@ -1553,14 +2209,13 @@ class ChatController extends GetxController {
           customGuidance.isEmpty ? defaultMemoryExtractionGuidance : customGuidance;
 
       // JSON-format instructions + trailing overhead is roughly fixed
-      // regardless of guidance (~280 tokens now that the schema also
-      // describes entity_name/entity_type/location/participants/
-      // connection, not just text/category/valence/tags); the guidance
-      // text itself is added on top since it's no longer a fixed size now
-      // that it's user-editable — a long custom override correctly eats
-      // into the budget left for the actual exchange instead of silently
-      // overflowing it.
-      const baseOverheadTokens = 280;
+      // regardless of guidance (~300 tokens for the array-of-objects
+      // schema describing entity_name/entity_type/location/participants/
+      // connection per object); the guidance text itself is added on top
+      // since it's no longer a fixed size now that it's user-editable — a
+      // long custom override correctly eats into the budget left for the
+      // actual exchange instead of silently overflowing it.
+      const baseOverheadTokens = 300;
       final guidanceTokens = (guidance.length / approxCharsPerToken).ceil();
       final overheadTokens = baseOverheadTokens + guidanceTokens;
       final availableTokens =
@@ -1600,25 +2255,30 @@ class ChatController extends GetxController {
           role: LlamaChatRole.system,
           text: '$guidance'
               '$existingMemoryContext\n\n'
-              'Respond with ONLY a single-line JSON object, no other text: '
-              '{"text": "<one short sentence, or empty string if nothing '
-              'durable>", "category": "<fact|preference|event|instruction|'
-              'general>", "valence": "<positive|negative|neutral>", '
-              '"tags": ["<a few short keywords>"], "entity_name": "<the '
-              'one named person, place, project, or organization this is '
-              'mainly about, or empty string if there isn\'t one>", '
-              '"entity_type": "<person|place|project|organization|event|'
-              'idea|none>", "location": "<a place named in this, or empty '
-              'string>", "participants": ["<other people/entities named '
-              'alongside entity_name, if any>"], "connection": "<how '
-              'entity_name relates to something else already known, in a '
-              'few words, or empty string if not stated>", '
-              '"contradicts_index": <the number of the already-remembered '
-              'item above that this replaces/updates, or null if none>, '
-              '"confidence": <0.0-1.0, how sure you are this is actually '
-              'true and durable — use a low number for a guess or '
-              'something ambiguous, a high number only when it was stated '
-              'plainly>}',
+              'Respond with ONLY a single-line JSON array, no other text — '
+              'one object per SEPARATE fact worth remembering (most '
+              'exchanges have zero or one; only use more than one entry '
+              'when the exchange genuinely states multiple distinct facts '
+              '— never split one fact into several entries, and never '
+              'repeat the same fact in two entries). Respond with exactly '
+              '[] if nothing durable. Up to $_maxFactsPerExtraction entries. '
+              'Each entry: {"text": "<one short sentence>", "category": '
+              '"<fact|preference|event|instruction|general>", "valence": '
+              '"<positive|negative|neutral>", "tags": ["<a few short '
+              'keywords>"], "entity_name": "<the one named person, place, '
+              'project, or organization this entry is mainly about, or '
+              'empty string if there isn\'t one>", "entity_type": '
+              '"<person|place|project|organization|event|idea|none>", '
+              '"location": "<a place named in this, or empty string>", '
+              '"participants": ["<other people/entities named alongside '
+              'entity_name, if any>"], "connection": "<how entity_name '
+              'relates to something else already known, in a few words, '
+              'or empty string if not stated>", "contradicts_index": '
+              '<the number of the already-remembered item above that this '
+              'entry replaces/updates, or null if none>, "confidence": '
+              '<0.0-1.0, how sure you are this is actually true and '
+              'durable — use a low number for a guess or something '
+              'ambiguous, a high number only when it was stated plainly>}',
         ),
         LlamaChatMessage.fromText(
           role: LlamaChatRole.user,
@@ -1631,24 +2291,25 @@ class ChatController extends GetxController {
               '[USER]: ${cap(userMsg.content)}\n'
               '[ASSISTANT]: ${cap(aiMsg.content)}\n\n'
               'Extract anything worth remembering from the transcript above '
-              'as that JSON object, and nothing else.',
+              'as that JSON array, and nothing else.',
         ),
       ];
 
       String? extracted;
-      ({
-        String text,
-        String category,
-        String valence,
-        List<String> tags,
-        int? contradictsIndex,
-        double confidence,
-        String entityName,
-        String entityType,
-        String location,
-        List<String> participants,
-        String connection,
-      })? parsed;
+      List<
+          ({
+            String text,
+            String category,
+            String valence,
+            List<String> tags,
+            int? contradictsIndex,
+            double confidence,
+            String entityName,
+            String entityType,
+            String location,
+            List<String> participants,
+            String connection,
+          })>? parsedFacts;
 
       // Up to two attempts: a small quantized model producing malformed
       // JSON is common enough that one retry meaningfully improves the hit
@@ -1675,17 +2336,24 @@ class ChatController extends GetxController {
           return;
         }
         extracted = attemptResult.trim();
-        parsed = _parseExtractionJson(extracted);
-        // A response that starts with '{' was clearly attempting JSON (the
-        // prompt asks for nothing else) — if full parsing still failed,
-        // it's a broken fragment, not a natural sentence, so it must never
-        // be stored verbatim (braces, quotes, field names and all) as if
-        // it were the memory itself. _parseExtractionJson already tries a
-        // regex-based partial recovery of just the "text" field for
-        // exactly this truncated-mid-object case; if even that comes back
-        // empty, retry once (small quantized models are inconsistent
-        // turn-to-turn), then give up.
-        final looksLikeBrokenJson = parsed == null && extracted.trimLeft().startsWith('{');
+        _log?.info(
+          'Memory extraction exchange — shown: [USER]: ${cap(userMsg.content)} '
+          '[ASSISTANT]: ${cap(aiMsg.content)}\nModel replied: $extracted',
+          source: 'Memory',
+        );
+        parsedFacts = _parseExtractionFacts(extracted);
+        // A response that starts with '{' or '[' was clearly attempting
+        // JSON (the prompt asks for nothing else) — if full parsing still
+        // failed, it's a broken fragment, not a natural sentence, so it
+        // must never be stored verbatim (braces, quotes, field names and
+        // all) as if it were the memory itself. _parseExtractionFacts
+        // already tries a regex-based partial recovery of just one "text"
+        // field for exactly this truncated-mid-object case; if even that
+        // comes back empty, retry once (small quantized models are
+        // inconsistent turn-to-turn), then give up.
+        final trimmedStart = extracted.trimLeft();
+        final looksLikeBrokenJson =
+            parsedFacts == null && (trimmedStart.startsWith('{') || trimmedStart.startsWith('['));
         if (!looksLikeBrokenJson) break;
         if (attempt == 0) {
           _log?.warn('Memory extraction got malformed JSON, retrying once.',
@@ -1700,136 +2368,208 @@ class ChatController extends GetxController {
         return;
       }
 
-      final noteText = parsed?.text ?? extracted ?? '';
-      final category = parsed?.category ?? 'general';
-      final valence = parsed?.valence ?? 'neutral';
-      final tags = parsed?.tags ?? const <String>[];
-      // 1-based index into relevantMemories, as shown to the model in the
-      // numbered "already remembered" list — null/out-of-range means no
-      // contradiction (or the model named something that isn't there).
-      final contradictsIndex = parsed?.contradictsIndex;
-      final contradictedMemory =
-          (contradictsIndex != null && contradictsIndex >= 1 && contradictsIndex <= relevantMemories.length)
-              ? relevantMemories[contradictsIndex - 1]
-              : null;
-      final confidence = parsed?.confidence ?? 1.0;
-      final entityName = parsed?.entityName ?? '';
-      final entityType = parsed?.entityType ?? 'none';
-      final entityLocation = parsed?.location ?? '';
-      final participants = parsed?.participants ?? const <String>[];
-      final connection = parsed?.connection ?? '';
+      if (parsedFacts == null && (extracted == null || extracted.isEmpty)) return;
+      // Fall back to treating the whole raw reply as one plain-text memory
+      // note (pre-array-schema behavior) if nothing parsed as JSON at all —
+      // a small model ignoring the JSON instruction entirely and just
+      // answering in prose shouldn't lose the memory outright.
+      final facts = parsedFacts ??
+          [
+            (
+              text: extracted ?? '',
+              category: 'general',
+              valence: 'neutral',
+              tags: const <String>[],
+              contradictsIndex: null,
+              confidence: 1.0,
+              entityName: '',
+              entityType: 'none',
+              location: '',
+              participants: const <String>[],
+              connection: '',
+            ),
+          ];
 
-      if (onDryRunResult != null) {
-        onDryRunResult(noteText, category, valence, confidence);
-        return;
-      }
-
-      // Whether JSON parsed or not, the "nothing durable" check still runs
-      // on the actual candidate text — a malformed-JSON model that still
-      // wrote "NONE" as its `text` field (or the whole raw response, if
-      // parsing failed outright) is still correctly recognized as empty.
-      if (MemoryHeuristics.isNoMemorySentinel(noteText)) {
-        _log?.info(
-          'Memory extraction found nothing durable in this turn.',
-          source: 'Memory',
-        );
-        return;
-      }
-
-      final vector = await _embedding.embed(noteText);
-      if (vector == null) {
-        _log?.warn('Memory extraction discarded: embedding failed for "$noteText".',
+      if (facts.isEmpty) {
+        // A clean "[]" response — the model explicitly found nothing
+        // durable, as distinct from a malformed response (handled above,
+        // returns before this point). Still needs to report an empty
+        // result to the verification harness (its negative test case
+        // expects exactly this outcome) and to log the same way the
+        // single-object "NONE"/empty-text case always has.
+        if (onDryRunResult != null) {
+          onDryRunResult('', 'general', 'neutral', 1.0);
+          return;
+        }
+        _log?.info('Memory extraction found nothing durable in this turn.',
             source: 'Memory');
         return;
       }
-      if (contradictedMemory != null) {
-        // Never goes through addIfNotDuplicate's near-duplicate check — a
-        // corrected fact (e.g. "favorite color is green" replacing "...is
-        // blue") can easily stay above the duplicate-similarity threshold
-        // against the OLD entry it's meant to replace, since the two
-        // sentences are structurally almost identical, which would
-        // silently reinforce the wrong (outdated) memory instead of
-        // recording the correction at all. resolveContradiction itself now
-        // branches on confidence: a confident correction supersedes the
-        // old fact outright (the previous unconditional behavior here); a
-        // low-confidence one is kept alongside it instead, both active and
-        // tagged 'conflicting', until something resolves which is right.
-        final resolved = await _memory.resolveContradiction(
-          oldId: contradictedMemory.id,
-          newText: noteText,
-          newEmbedding: vector,
-          confidence: confidence,
-          category: category,
-          valence: valence,
-          tags: tags,
-          sourceChatId: chatId,
-          entityName: entityName,
-          entityType: entityType,
-          location: entityLocation,
-          participants: participants,
-          connection: connection,
-        );
-        if (!resolved) {
-          // The memory being corrected was deleted out from under this
-          // in-flight extraction (e.g. from the Memory screen) between
-          // when it was matched and when this awaited call landed —
-          // nothing to correct anymore, so say nothing succeeded.
-          _log?.warn(
-            'Memory correction discarded: the memory being corrected no '
-            'longer exists.',
+
+      if (onDryRunResult != null) {
+        // Report only the FIRST fact — the verification harness's
+        // Completer captures whatever the single call gives it, and its
+        // fixed test cases are all single-fact exchanges anyway, so the
+        // first (and normally only) parsed fact is exactly what it
+        // expects to check. Calling it once per fact here would have the
+        // harness end up checking whichever fact happened to be reported
+        // last, not first, since these calls run synchronously before the
+        // caller's `await completer.future` ever gets to observe them.
+        final first = facts.first;
+        onDryRunResult(first.text, first.category, first.valence, first.confidence);
+        return;
+      }
+
+      // Tracks which already-remembered entries this batch has already
+      // superseded — a batch extracting two facts that both cite the same
+      // contradicts_index (e.g. two separate corrections to the same old
+      // fact in one message) would otherwise call resolveContradiction
+      // twice on the same oldId, and the second call's markSuperseded
+      // would silently overwrite the first correction's supersededBy
+      // link, orphaning it with no recorded link to what it corrected.
+      final consumedContradictionIds = <String>{};
+
+      for (final fact in facts.take(_maxFactsPerExtraction)) {
+        final noteText = fact.text;
+        // Whether JSON parsed or not, the "nothing durable" check still
+        // runs on the actual candidate text — a malformed-JSON model that
+        // still wrote "NONE" as its `text` field (or the whole raw
+        // response, if parsing failed outright) is still correctly
+        // recognized as empty.
+        if (MemoryHeuristics.isNoMemorySentinel(noteText)) {
+          _log?.info(
+            'Memory extraction found nothing durable in this turn.',
             source: 'Memory',
           );
-          return;
+          continue;
         }
-        final confident = confidence >= MemoryService.confidentCorrectionThreshold;
-        _log?.info(
-          confident
-              ? 'Memory updated (superseded prior entry, confidence '
-                  '${confidence.toStringAsFixed(2)}): "$noteText" ($category/$valence)'
-              : 'Memory conflict recorded (low confidence '
-                  '${confidence.toStringAsFixed(2)}, both kept active): '
-                  '"$noteText" ($category/$valence)',
-          source: 'Memory',
-        );
-        _toast(confident
-            ? 'Memory updated: ${_truncateForToast(noteText)}'
-            : 'Possible conflict noted: ${_truncateForToast(noteText)}');
-        aiMsg.telemetry?.setExtractedValence(category, valence);
-      } else {
-        final result = await _memory.addIfNotDuplicate(
-          noteText,
-          vector,
-          sourceChatId: chatId,
-          category: category,
-          valence: valence,
-          tags: tags,
-          confidence: confidence,
-          // Captured automatically, not something a human deliberately
-          // chose to save — starts on probation (see
-          // MemoryService.runWorkingMemoryMaintenance) and earns permanence
-          // by actually getting reinforced, rather than being permanent the
-          // instant it's written.
-          isWorkingMemory: true,
-          entityName: entityName,
-          entityType: entityType,
-          location: entityLocation,
-          participants: participants,
-          connection: connection,
-        );
-        if (result.wasNew) {
-          _log?.info('Memory saved: "$noteText" ($category/$valence)', source: 'Memory');
-          _toast('Memory saved: ${_truncateForToast(noteText)}');
-          aiMsg.telemetry?.setExtractedValence(category, valence);
-        } else if (result.wasEnriched) {
-          _log?.info('Memory enriched: "$noteText" ($category/$valence)', source: 'Memory');
-          _toast('Memory updated: ${_truncateForToast(noteText)}');
-          aiMsg.telemetry?.setExtractedValence(category, valence);
+
+        final vector = await _embedding.embed(noteText);
+        if (vector == null) {
+          _log?.warn('Memory extraction discarded: embedding failed for "$noteText".',
+              source: 'Memory');
+          continue;
+        }
+
+        // 1-based index into relevantMemories, as shown to the model in the
+        // numbered "already remembered" list — null/out-of-range means no
+        // contradiction (or the model named something that isn't there).
+        // Always resolved against the ORIGINAL pre-turn list, even for a
+        // later fact in this same batch — a same-turn fact contradicting an
+        // earlier same-turn fact isn't handled specially here.
+        final contradictsIndex = fact.contradictsIndex;
+        var contradictedMemory = (contradictsIndex != null &&
+                contradictsIndex >= 1 &&
+                contradictsIndex <= relevantMemories.length)
+            ? relevantMemories[contradictsIndex - 1]
+            : null;
+        if (contradictedMemory != null &&
+            consumedContradictionIds.contains(contradictedMemory.id)) {
+          // Already superseded by an earlier fact in this same batch —
+          // treat this one as a new, independent fact instead of
+          // re-superseding (and silently clobbering) the same entry twice.
+          _log?.info(
+            'Memory extraction: "$noteText" also cited an already-superseded '
+            'entry in this batch — saving as a new fact instead of '
+            'superseding again.',
+            source: 'Memory',
+          );
+          contradictedMemory = null;
+        }
+
+        if (contradictedMemory != null) {
+          // Never goes through addIfNotDuplicate's near-duplicate check — a
+          // corrected fact (e.g. "favorite color is green" replacing "...is
+          // blue") can easily stay above the duplicate-similarity threshold
+          // against the OLD entry it's meant to replace, since the two
+          // sentences are structurally almost identical, which would
+          // silently reinforce the wrong (outdated) memory instead of
+          // recording the correction at all. resolveContradiction itself now
+          // branches on confidence: a confident correction supersedes the
+          // old fact outright (the previous unconditional behavior here); a
+          // low-confidence one is kept alongside it instead, both active and
+          // tagged 'conflicting', until something resolves which is right.
+          final resolved = await _memory.resolveContradiction(
+            oldId: contradictedMemory.id,
+            newText: noteText,
+            newEmbedding: vector,
+            confidence: fact.confidence,
+            category: fact.category,
+            valence: fact.valence,
+            tags: fact.tags,
+            sourceChatId: chatId,
+            entityName: fact.entityName,
+            entityType: fact.entityType,
+            location: fact.location,
+            participants: fact.participants,
+            connection: fact.connection,
+          );
+          if (!resolved) {
+            // The memory being corrected was deleted out from under this
+            // in-flight extraction (e.g. from the Memory screen) between
+            // when it was matched and when this awaited call landed —
+            // nothing to correct anymore, so say nothing succeeded.
+            _log?.warn(
+              'Memory correction discarded: the memory being corrected no '
+              'longer exists.',
+              source: 'Memory',
+            );
+            continue;
+          }
+          consumedContradictionIds.add(contradictedMemory.id);
+          final confident = fact.confidence >= MemoryService.confidentCorrectionThreshold;
+          _log?.info(
+            confident
+                ? 'Memory updated (superseded prior entry, confidence '
+                    '${fact.confidence.toStringAsFixed(2)}): "$noteText" '
+                    '(${fact.category}/${fact.valence})'
+                : 'Memory conflict recorded (low confidence '
+                    '${fact.confidence.toStringAsFixed(2)}, both kept active): '
+                    '"$noteText" (${fact.category}/${fact.valence})',
+            source: 'Memory',
+          );
+          _toast(confident
+              ? 'Memory updated: ${_truncateForToast(noteText)}'
+              : 'Possible conflict noted: ${_truncateForToast(noteText)}');
+          aiMsg.telemetry?.setExtractedValence(fact.category, fact.valence);
         } else {
-          // Deliberately no telemetry marker here — this is a pure repeat
-          // of something already known, nothing new was captured, and the
-          // insight panel's "memory captured" chip would be misleading on
-          // a turn where nothing actually changed in memory.
-          _log?.info('Memory reinforced (already known): "$noteText"', source: 'Memory');
+          final result = await _memory.addIfNotDuplicate(
+            noteText,
+            vector,
+            sourceChatId: chatId,
+            category: fact.category,
+            valence: fact.valence,
+            tags: fact.tags,
+            confidence: fact.confidence,
+            // Captured automatically, not something a human deliberately
+            // chose to save — starts on probation (see
+            // MemoryService.runWorkingMemoryMaintenance) and earns permanence
+            // by actually getting reinforced, rather than being permanent the
+            // instant it's written.
+            isWorkingMemory: true,
+            entityName: fact.entityName,
+            entityType: fact.entityType,
+            location: fact.location,
+            participants: fact.participants,
+            connection: fact.connection,
+          );
+          if (result.wasNew) {
+            _log?.info('Memory saved: "$noteText" (${fact.category}/${fact.valence})',
+                source: 'Memory');
+            _toast('Memory saved: ${_truncateForToast(noteText)}');
+            aiMsg.telemetry?.setExtractedValence(fact.category, fact.valence);
+          } else if (result.wasEnriched) {
+            _log?.info('Memory enriched: "$noteText" (${fact.category}/${fact.valence})',
+                source: 'Memory');
+            _toast('Memory updated: ${_truncateForToast(noteText)}');
+            aiMsg.telemetry?.setExtractedValence(fact.category, fact.valence);
+          } else {
+            // Deliberately no telemetry marker here — this is a pure repeat
+            // of something already known, nothing new was captured, and the
+            // insight panel's "memory captured" chip would be misleading on
+            // a turn where nothing actually changed in memory.
+            _log?.info('Memory reinforced (already known): "$noteText"', source: 'Memory');
+          }
         }
       }
     } catch (e) {
@@ -1844,11 +2584,18 @@ class ChatController extends GetxController {
   static final RegExp _extractedTextFieldPattern =
       RegExp(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"');
 
-  /// Best-effort parse of the extraction model's JSON response. Returns
-  /// null (never throws) if nothing usable could be recovered at all, so
-  /// the caller can fall back to treating the raw text as a plain memory
-  /// note — a small quantized model failing to format valid JSON should
-  /// degrade gracefully, not lose the memory entirely.
+  static const _validExtractionCategories = {
+    'fact', 'preference', 'event', 'instruction', 'general',
+  };
+  static const _validExtractionValences = {'positive', 'negative', 'neutral'};
+  static const _validExtractionEntityTypes = {
+    'person', 'place', 'project', 'organization', 'event', 'idea', 'none',
+  };
+
+  /// Parses one already-decoded fact object (one element of the extraction
+  /// array, or the whole response when a model ignores the array
+  /// instruction and emits a bare object) into the fact record shape.
+  /// Returns null if [decoded] isn't actually a Map.
   ({
     String text,
     String category,
@@ -1862,117 +2609,185 @@ class ChatController extends GetxController {
     List<String> participants,
     String connection,
   })?
-      _parseExtractionJson(String raw) {
-    const validCategories = {'fact', 'preference', 'event', 'instruction', 'general'};
-    const validValences = {'positive', 'negative', 'neutral'};
-    const validEntityTypes = {
-      'person', 'place', 'project', 'organization', 'event', 'idea', 'none',
-    };
+      _factFromDecodedJson(Object? decoded) {
+    if (decoded is! Map) return null;
+    final text = (decoded['text'] as Object?)?.toString().trim() ?? '';
+    final categoryRaw = (decoded['category'] as Object?)?.toString().toLowerCase();
+    final valenceRaw = (decoded['valence'] as Object?)?.toString().toLowerCase();
+    final tagsRaw = decoded['tags'];
+    final tags = tagsRaw is List
+        ? tagsRaw.map((e) => e.toString().trim()).where((e) => e.isNotEmpty).take(5).toList()
+        : <String>[];
+    final entityName = (decoded['entity_name'] as Object?)?.toString().trim() ?? '';
+    final entityTypeRaw = (decoded['entity_type'] as Object?)?.toString().toLowerCase();
+    final entityLocation = (decoded['location'] as Object?)?.toString().trim() ?? '';
+    final participantsRaw = decoded['participants'];
+    final participants = participantsRaw is List
+        ? participantsRaw
+            .map((e) => e.toString().trim())
+            .where((e) => e.isNotEmpty)
+            .take(10)
+            .toList()
+        : <String>[];
+    final connection = (decoded['connection'] as Object?)?.toString().trim() ?? '';
+    // Accept a real JSON number or a stringified one ("2") — a small
+    // quantized model quoting a number is a common enough formatting
+    // slip. null/"null"/missing/anything else means "no contradiction".
+    final contradictsRaw = decoded['contradicts_index'];
+    final contradictsIndex = contradictsRaw is num
+        ? contradictsRaw.toInt()
+        : int.tryParse(contradictsRaw?.toString() ?? '');
+    // Same leniency as above — a stringified "0.8" is as acceptable as a
+    // real number. Missing/unparseable defaults to 0.5, not 1.0: this is
+    // the same small-model class that produces malformed JSON often enough
+    // to need the retry loop above, so a dropped field reads as another
+    // symptom of imperfect output, not a real signal of certainty.
+    // Defaulting high would route a dropped-field contradiction straight
+    // into resolveContradiction's confident-supersede branch —
+    // permanently overwriting a correct memory on what might just be a
+    // formatting slip, which is exactly the case the confidence field
+    // exists to catch. Defaulting to the same 0.5 the truncated-fragment
+    // path below uses keeps both facts active and flagged instead — the
+    // safer failure mode when genuinely unsure which way it should go.
+    final confidenceRaw = decoded['confidence'];
+    final confidence = (confidenceRaw is num
+                ? confidenceRaw.toDouble()
+                : double.tryParse(confidenceRaw?.toString() ?? ''))
+            ?.clamp(0.0, 1.0) ??
+        0.5;
 
+    return (
+      text: text,
+      category: _validExtractionCategories.contains(categoryRaw) ? categoryRaw! : 'general',
+      valence: _validExtractionValences.contains(valenceRaw) ? valenceRaw! : 'neutral',
+      tags: tags,
+      contradictsIndex: contradictsIndex,
+      confidence: confidence,
+      entityName: entityName,
+      entityType:
+          _validExtractionEntityTypes.contains(entityTypeRaw) ? entityTypeRaw! : 'none',
+      location: entityLocation,
+      participants: participants,
+      connection: connection,
+    );
+  }
+
+  /// Best-effort parse of the extraction model's JSON response — normally
+  /// a JSON array of 0 to [_maxFactsPerExtraction] fact objects, but
+  /// tolerant of a model that ignores the array instruction and emits a
+  /// bare single object instead (wrapped into a one-element list). Returns
+  /// null (never throws) if nothing usable could be recovered at all, so
+  /// the caller can fall back to treating the raw text as a single plain
+  /// memory note — a small quantized model failing to format valid JSON
+  /// should degrade gracefully, not lose the memory entirely.
+  List<
+      ({
+        String text,
+        String category,
+        String valence,
+        List<String> tags,
+        int? contradictsIndex,
+        double confidence,
+        String entityName,
+        String entityType,
+        String location,
+        List<String> participants,
+        String connection,
+      })>?
+      _parseExtractionFacts(String raw) {
+    // Only attempt the array shape when the response actually STARTS with
+    // '[' (after whitespace) — a bare object still contains a real '[' and
+    // ']' pair of its own (an empty "tags": [] or "participants": [] is
+    // exactly the kind of field a small model omits/leaves empty), and
+    // blindly scanning for the outermost brackets by position would
+    // mistake that inner empty array for the whole response being "[]",
+    // silently discarding a real fact as "nothing durable". Checking the
+    // leading character first tells the two shapes apart correctly instead
+    // of guessing from bracket positions alone.
+    if (raw.trimLeft().startsWith('[')) {
+      try {
+        final start = raw.indexOf('[');
+        final end = raw.lastIndexOf(']');
+        if (start != -1 && end != -1 && end > start) {
+          final decoded = jsonDecode(raw.substring(start, end + 1));
+          if (decoded is List) {
+            final facts = decoded
+                .map(_factFromDecodedJson)
+                .whereType<
+                    ({
+                      String text,
+                      String category,
+                      String valence,
+                      List<String> tags,
+                      int? contradictsIndex,
+                      double confidence,
+                      String entityName,
+                      String entityType,
+                      String location,
+                      List<String> participants,
+                      String connection,
+                    })>()
+                .take(_maxFactsPerExtraction)
+                .toList();
+            // An empty array (nothing durable) is a valid, meaningful
+            // parse — return it as-is rather than falling through to
+            // object/regex recovery below, which would otherwise
+            // manufacture a fact out of a response that correctly said
+            // there wasn't one.
+            if (facts.isNotEmpty || decoded.isEmpty) return facts;
+          }
+        }
+      } catch (_) {
+        // Fall through — try the bare-object shape next.
+      }
+    }
+
+    // A model that ignored the array instruction and emitted one bare
+    // object directly — still a clean, intentional response, just not in
+    // the shape asked for.
     try {
       final start = raw.indexOf('{');
       final end = raw.lastIndexOf('}');
       if (start != -1 && end != -1 && end > start) {
         final decoded = jsonDecode(raw.substring(start, end + 1));
-        if (decoded is Map) {
-          final text = (decoded['text'] as Object?)?.toString().trim() ?? '';
-          final categoryRaw = (decoded['category'] as Object?)?.toString().toLowerCase();
-          final valenceRaw = (decoded['valence'] as Object?)?.toString().toLowerCase();
-          final tagsRaw = decoded['tags'];
-          final tags = tagsRaw is List
-              ? tagsRaw
-                  .map((e) => e.toString().trim())
-                  .where((e) => e.isNotEmpty)
-                  .take(5)
-                  .toList()
-              : <String>[];
-          final entityName = (decoded['entity_name'] as Object?)?.toString().trim() ?? '';
-          final entityTypeRaw =
-              (decoded['entity_type'] as Object?)?.toString().toLowerCase();
-          final entityLocation = (decoded['location'] as Object?)?.toString().trim() ?? '';
-          final participantsRaw = decoded['participants'];
-          final participants = participantsRaw is List
-              ? participantsRaw
-                  .map((e) => e.toString().trim())
-                  .where((e) => e.isNotEmpty)
-                  .take(10)
-                  .toList()
-              : <String>[];
-          final connection = (decoded['connection'] as Object?)?.toString().trim() ?? '';
-          // Accept a real JSON number or a stringified one ("2") — a small
-          // quantized model quoting a number is a common enough formatting
-          // slip. null/"null"/missing/anything else means "no contradiction".
-          final contradictsRaw = decoded['contradicts_index'];
-          final contradictsIndex = contradictsRaw is num
-              ? contradictsRaw.toInt()
-              : int.tryParse(contradictsRaw?.toString() ?? '');
-          // Same leniency as above — a stringified "0.8" is as acceptable
-          // as a real number. Missing/unparseable defaults to 0.5, not
-          // 1.0: this is the same small-model class that produces
-          // malformed JSON often enough to need the retry loop above, so a
-          // dropped field reads as another symptom of imperfect output,
-          // not a real signal of certainty. Defaulting high would route a
-          // dropped-field contradiction straight into resolveContradiction's
-          // confident-supersede branch — permanently overwriting a
-          // correct memory on what might just be a formatting slip, which
-          // is exactly the case the confidence field exists to catch.
-          // Defaulting to the same 0.5 the truncated-fragment path below
-          // uses keeps both facts active and flagged instead — the safer
-          // failure mode when genuinely unsure which way it should go.
-          final confidenceRaw = decoded['confidence'];
-          final confidence = (confidenceRaw is num
-                  ? confidenceRaw.toDouble()
-                  : double.tryParse(confidenceRaw?.toString() ?? ''))
-              ?.clamp(0.0, 1.0) ??
-              0.5;
-
-          return (
-            text: text,
-            category: validCategories.contains(categoryRaw) ? categoryRaw! : 'general',
-            valence: validValences.contains(valenceRaw) ? valenceRaw! : 'neutral',
-            tags: tags,
-            contradictsIndex: contradictsIndex,
-            confidence: confidence,
-            entityName: entityName,
-            entityType: validEntityTypes.contains(entityTypeRaw) ? entityTypeRaw! : 'none',
-            location: entityLocation,
-            participants: participants,
-            connection: connection,
-          );
-        }
+        final fact = _factFromDecodedJson(decoded);
+        if (fact != null) return [fact];
       }
     } catch (_) {
       // Fall through to partial recovery below.
     }
 
     // Full parse failed — most likely the response got cut off mid-object
-    // by the token cap before the closing brace. Try to salvage just the
-    // "text" field via regex: if the model got that far before running out
-    // of budget, the fact itself is usually still intact even though the
-    // rest of the object (category/tags/etc) never got written.
+    // by the token cap before the closing brace/bracket. Try to salvage
+    // just the FIRST "text" field via regex: if the model got that far
+    // before running out of budget, that one fact is usually still intact
+    // even though the rest of the object (category/tags/etc, and any
+    // further array entries) never got written.
     final match = _extractedTextFieldPattern.firstMatch(raw);
     if (match == null) return null;
     final recovered = match.group(1)?.trim() ?? '';
     if (recovered.isEmpty) return null;
-    return (
-      text: recovered,
-      category: 'general',
-      valence: 'neutral',
-      tags: const [],
-      contradictsIndex: null,
-      // Recovered from a truncated fragment, not a clean parse — treat as
-      // lower-confidence than a fully-formed response, since there's no
-      // way to know if the model would have hedged in the part that got
-      // cut off.
-      confidence: 0.5,
-      // Everything past "text" was cut off before it could be recovered —
-      // no entity fields to salvage from a fragment this short.
-      entityName: '',
-      entityType: 'none',
-      location: '',
-      participants: const [],
-      connection: '',
-    );
+    return [
+      (
+        text: recovered,
+        category: 'general',
+        valence: 'neutral',
+        tags: const [],
+        contradictsIndex: null,
+        // Recovered from a truncated fragment, not a clean parse — treat as
+        // lower-confidence than a fully-formed response, since there's no
+        // way to know if the model would have hedged in the part that got
+        // cut off.
+        confidence: 0.5,
+        // Everything past "text" was cut off before it could be recovered —
+        // no entity fields to salvage from a fragment this short.
+        entityName: '',
+        entityType: 'none',
+        location: '',
+        participants: const [],
+        connection: '',
+      ),
+    ];
   }
 
   /// Stop current generation.

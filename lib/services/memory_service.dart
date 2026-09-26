@@ -575,10 +575,18 @@ class MemoryService extends GetxService {
   /// than embedding distance. Still respects the same link cap as
   /// automatic linking, FIFO-dropping the oldest if either side is full.
   Future<void> linkManually(String idA, String idB) async {
-    if (idA == idB) return;
+    if (_linkManuallyInMemory(idA, idB)) await _persist();
+  }
+
+  /// The actual link mutation, without persisting — shared by
+  /// [linkManually] (one pair, persists immediately) and
+  /// [linkManyToHub] (many pairs, persists once at the end). Returns
+  /// whether either id was found (i.e. whether anything actually changed).
+  bool _linkManuallyInMemory(String idA, String idB) {
+    if (idA == idB) return false;
     final idxA = entries.indexWhere((e) => e.id == idA);
     final idxB = entries.indexWhere((e) => e.id == idB);
-    if (idxA == -1 || idxB == -1) return;
+    if (idxA == -1 || idxB == -1) return false;
     void addLink(int idx, String otherId) {
       if (entries[idx].linkedIds.contains(otherId)) return;
       final updated = [...entries[idx].linkedIds, otherId];
@@ -590,7 +598,20 @@ class MemoryService extends GetxService {
 
     addLink(idxA, idB);
     addLink(idxB, idA);
-    await _persist();
+    return true;
+  }
+
+  /// Links [hubId] to every id in [otherIds] in one pass — one disk write
+  /// regardless of how many links are made, same reasoning as
+  /// [deleteMany]/[applyAttentionReflection]. Used by Frame analysis to
+  /// link a new Frame to a sample of its source memories without paying a
+  /// full-store serialize+write per link.
+  Future<void> linkManyToHub(String hubId, Iterable<String> otherIds) async {
+    var changed = false;
+    for (final otherId in otherIds) {
+      if (_linkManuallyInMemory(hubId, otherId)) changed = true;
+    }
+    if (changed) await _persist();
   }
 
   Future<void> unlinkManually(String idA, String idB) async {
@@ -868,6 +889,32 @@ class MemoryService extends GetxService {
     }
     await _persist();
     return chosen.map((e) => e.id).toList();
+  }
+
+  /// Applies the main model's own attention-reflection judgments (see
+  /// ChatController._runAttentionReflection) to the memories it actually
+  /// reflected on — one batched write regardless of how many entries were
+  /// touched, same reasoning as [deleteMany]. Unknown ids (a memory deleted
+  /// between when reflection started and when this lands) are silently
+  /// skipped rather than treated as an error — reflection is a soft,
+  /// best-effort signal, not a correctness-critical write.
+  Future<void> applyAttentionReflection(
+    List<({String id, double attention, String note})> updates,
+  ) async {
+    if (updates.isEmpty) return;
+    final now = DateTime.now();
+    var applied = 0;
+    for (final u in updates) {
+      final idx = entries.indexWhere((e) => e.id == u.id);
+      if (idx == -1) continue;
+      entries[idx] = entries[idx].copyWith(
+        attentionScore: u.attention.clamp(0.0, 1.0),
+        attentionNote: u.note,
+        lastReflectedAt: now,
+      );
+      applied++;
+    }
+    if (applied > 0) await _persist();
   }
 
   /// Public entry point for [_cosineSimilarity] — used by callers outside

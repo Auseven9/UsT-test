@@ -136,6 +136,35 @@ class ChatStorageService extends GetxService {
 
   set helperModelFilename(String value) => _settingsBox.put('helper_model', value);
 
+  /// Filename of an additional chat model — separate from the always-
+  /// loaded helper above — that takes a turn as the "second opinion" in
+  /// Frame analysis every other cycle it runs (see
+  /// ChatController._runFrameAnalysis). Unlike the helper, this model is
+  /// NOT kept loaded: it's loaded transiently for just that one cycle's
+  /// generation, then torn down immediately after, so it costs nothing
+  /// the rest of the time. Empty string means no rotation is configured —
+  /// Frame analysis always uses the regular helper as its second opinion,
+  /// same as before this existed. This is specifically how a spare
+  /// downloaded model with no other role (e.g. a small model you're not
+  /// using as your main chat model or your helper) gets used for
+  /// something instead of just sitting on disk.
+  String get secondOpinionModelFilename =>
+      _settingsBox.get('second_opinion_model', defaultValue: '') as String;
+
+  set secondOpinionModelFilename(String value) =>
+      _settingsBox.put('second_opinion_model', value);
+
+  /// Alternates true/false each time Frame analysis actually runs, so the
+  /// second-opinion model and the regular helper take turns deterministically
+  /// (every other cycle each) rather than randomly. Only consulted when
+  /// [secondOpinionModelFilename] is set — with no rotation model
+  /// configured, this is never read.
+  bool get frameUsesSecondOpinionNextCycle =>
+      _settingsBox.get('frame_uses_second_opinion_next_cycle', defaultValue: true) as bool;
+
+  set frameUsesSecondOpinionNextCycle(bool value) =>
+      _settingsBox.put('frame_uses_second_opinion_next_cycle', value);
+
   /// Custom instructions for the background memory-extraction model —
   /// what counts as "worth remembering". Empty string means use the app's
   /// built-in default (see `defaultMemoryExtractionGuidance` at the top of
@@ -151,19 +180,73 @@ class ChatStorageService extends GetxService {
   set memoryExtractionGuidance(String value) =>
       _settingsBox.put('memory_extraction_guidance', value);
 
-  /// Minutes between periodic memory-health sweeps (flush any pending write,
+  /// Seconds between periodic memory-health sweeps (flush any pending write,
   /// re-verify each model's loaded/armed state, probe the embedding model
   /// with a real request, surface anything wrong) — 0 disables the sweep
-  /// entirely. The user is asked to confirm each cycle before it runs (see
-  /// ChatController._confirmAndRunMemorySweep), since the embedding probe
-  /// is real inference, not a free flag check — a short interval mostly
-  /// just means being asked more often, not silent background cost.
-  int get memorySweepIntervalMinutes =>
-      (_settingsBox.get('memory_sweep_interval_minutes', defaultValue: 10) as num)
+  /// entirely. Range is 5 seconds to 3600 (60 minutes); see
+  /// [sweepRequiresConfirmation] for whether each cycle asks first — at the
+  /// short end of that range a per-cycle confirmation dialog would be
+  /// unusable, so the sweep runs silently in the background by default.
+  int get memorySweepIntervalSeconds {
+    if (_settingsBox.containsKey('memory_sweep_interval_seconds')) {
+      return (_settingsBox.get('memory_sweep_interval_seconds') as num).toInt();
+    }
+    // One-time migration from the old minutes-based key (including an
+    // explicit 0 = disabled) rather than silently reverting a value the
+    // user had already set — an install that previously turned the sweep
+    // off, or picked a specific interval, keeps that choice instead of
+    // quietly reverting to the new default.
+    if (_settingsBox.containsKey('memory_sweep_interval_minutes')) {
+      final oldMinutes = (_settingsBox.get('memory_sweep_interval_minutes') as num).toInt();
+      return oldMinutes * 60;
+    }
+    return 600;
+  }
+
+  set memorySweepIntervalSeconds(int value) =>
+      _settingsBox.put('memory_sweep_interval_seconds', value);
+
+  /// Whether each sweep cycle pops a confirmation dialog before running
+  /// (the original behavior) rather than running silently in the
+  /// background. Defaults to false: a sweep interval as short as 5 seconds
+  /// makes a per-cycle prompt unusable, and the sweep's own findings are
+  /// already visible in the log and via toasts on real problems.
+  bool get sweepRequiresConfirmation =>
+      _settingsBox.get('sweep_requires_confirmation', defaultValue: false) as bool;
+
+  set sweepRequiresConfirmation(bool value) =>
+      _settingsBox.put('sweep_requires_confirmation', value);
+
+  /// How many sweep cycles between each Frame analysis pass (see
+  /// ChatController._runFrameAnalysis) — builds one hierarchical summary of
+  /// the whole memory store, then has BOTH the main and helper model
+  /// independently interpret it with the same instructions. Heavier than
+  /// attention reflection (a map-reduce summarization pass plus two full
+  /// model generations), so this defaults to a rarer cadence than that.
+  int get frameAnalysisEveryNSweeps =>
+      (_settingsBox.get('frame_analysis_every_n_sweeps', defaultValue: 20) as num).toInt();
+
+  set frameAnalysisEveryNSweeps(int value) =>
+      _settingsBox.put('frame_analysis_every_n_sweeps', value);
+
+  /// How many sweep cycles between each attention-reflection pass (see
+  /// ChatController._runAttentionReflection) — a heavier pass that spins up
+  /// the main model itself to reflect on recent memories, so it runs far
+  /// less often than the lightweight health sweep it's piggybacked on.
+  int get attentionReflectionEveryNSweeps =>
+      (_settingsBox.get('attention_reflection_every_n_sweeps', defaultValue: 10) as num)
           .toInt();
 
-  set memorySweepIntervalMinutes(int value) =>
-      _settingsBox.put('memory_sweep_interval_minutes', value);
+  set attentionReflectionEveryNSweeps(int value) =>
+      _settingsBox.put('attention_reflection_every_n_sweeps', value);
+
+  /// Running count of completed sweep cycles, persisted so the "every N
+  /// sweeps" cadence for attention reflection survives an app restart
+  /// instead of resetting its count to zero every launch.
+  int get sweepCycleCount =>
+      (_settingsBox.get('sweep_cycle_count', defaultValue: 0) as num).toInt();
+
+  set sweepCycleCount(int value) => _settingsBox.put('sweep_cycle_count', value);
 
   // ── Context & Sampling ──────────────────────────────────────
 
@@ -250,6 +333,26 @@ class ChatStorageService extends GetxService {
 
   set advancedToolsEnabled(bool value) =>
       _settingsBox.put('advanced_tools_enabled', value);
+
+  /// The original hardcoded round cap, kept as the persisted default and
+  /// as the one place chat_controller.dart's documentation/upper-bound
+  /// clamp reads it from (a private `_`-prefixed constant there can't be
+  /// referenced across files in Dart, so this is the single source of
+  /// truth for both instead of two independent literals that could drift).
+  static const defaultMaxToolRounds = 3;
+
+  /// How many tool-call ↔ tool-result round trips a single message can
+  /// trigger before the app gives up and forces a final answer from
+  /// whatever the tools returned so far. Bounded on purpose — a model that
+  /// keeps calling tools instead of answering shouldn't be able to turn
+  /// one message into an unbounded battery/time sink on a phone, but some
+  /// tasks genuinely need more than a few round trips (searching memory,
+  /// then writing several facts, then checking something else), so this
+  /// is adjustable rather than fixed.
+  int get maxToolRounds =>
+      (_settingsBox.get('max_tool_rounds', defaultValue: defaultMaxToolRounds) as num).toInt();
+
+  set maxToolRounds(int value) => _settingsBox.put('max_tool_rounds', value);
 
   /// Whether a bounded second generation (helper model if armed, main model
   /// otherwise) reviews each answer for contradictions with memory or

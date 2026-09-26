@@ -1192,6 +1192,25 @@ class _GenerationSettingsCardState extends State<_GenerationSettingsCard> {
 
           const SizedBox(height: 8),
 
+          Text(
+            'Max tool rounds per message',
+            style: TextStyle(color: context.text, fontSize: 14),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'How many tool-call round trips one message can trigger before '
+            'the app forces a final answer — raise this if a task '
+            'genuinely needs several steps (search memory, then save a '
+            'few facts, then check something else); a model that keeps '
+            'calling tools instead of answering will just spend more time '
+            'and battery per round allowed.',
+            style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+          ),
+          const SizedBox(height: 8),
+          _MaxToolRoundsRow(storage: widget.storage),
+
+          const SizedBox(height: 8),
+
           // ── Self-critique toggle ──
           TutorialTarget(
             id: 'settings.self_critique',
@@ -1621,11 +1640,13 @@ class _PersistentMemoryCard extends StatefulWidget {
 
 class _PersistentMemoryCardState extends State<_PersistentMemoryCard> {
   late bool _enabled;
+  late String _secondOpinionFilename;
 
   @override
   void initState() {
     super.initState();
     _enabled = widget.storage.persistentMemoryEnabled;
+    _secondOpinionFilename = widget.storage.secondOpinionModelFilename;
   }
 
   @override
@@ -1787,22 +1808,206 @@ class _PersistentMemoryCardState extends State<_PersistentMemoryCard> {
                   style: TextStyle(color: context.text, fontSize: 14)),
               const SizedBox(height: 4),
               Text(
-                'On this interval, asks before running — a real check, not '
-                'just a flag read: verifies every configured model is '
-                'actually loaded, probes the embedding model with a real '
-                'request, and flushes any pending memory write to disk. '
-                'If everything checks out and a helper model is armed, it '
-                'also looks for connections across recent memories, which '
-                'can add a new note. Declining just skips that cycle. Set '
-                'to 0 to disable.',
+                'On this interval, runs a real background check: verifies '
+                'every configured model is actually loaded, probes the '
+                'embedding model with a real request, and flushes any '
+                'pending memory write to disk. If everything checks out '
+                'and a helper model is armed, it also looks for '
+                'connections across recent memories, which can add a new '
+                'note. Runs silently by default — turn on "Ask before each '
+                'sweep" below if you\'d rather approve each cycle. Set to '
+                '0 to disable.',
                 style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
               ),
               const SizedBox(height: 8),
               _SweepIntervalRow(storage: widget.storage),
+              const SizedBox(height: 8),
+              _SweepConfirmationToggle(storage: widget.storage),
+              const SizedBox(height: 16),
+              Text('Attention Reflection',
+                  style: TextStyle(color: context.text, fontSize: 14)),
+              const SizedBox(height: 4),
+              Text(
+                'Every this-many sweep cycles, spins up the main model to '
+                'reflect in its own words on a sample of recent memories — '
+                'what it remembers, and which feel more or less important '
+                'to keep in mind. If a helper model is armed, that model '
+                'then reads the reflection and turns it into a per-memory '
+                'attention score, visible in the memory browser and graph. '
+                'Spends a real main-model generation, so it runs far less '
+                'often than the sweep itself.',
+                style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+              ),
+              const SizedBox(height: 8),
+              _CadenceRow(
+                getValue: () => widget.storage.attentionReflectionEveryNSweeps,
+                setValue: (v) => widget.storage.attentionReflectionEveryNSweeps = v,
+              ),
+              const SizedBox(height: 16),
+              Text('Frame Analysis',
+                  style: TextStyle(color: context.text, fontSize: 14)),
+              const SizedBox(height: 4),
+              Text(
+                'Every this-many sweep cycles, builds one "Frame" — a '
+                'summary standing in for everything currently remembered — '
+                'then has BOTH the main and helper model independently '
+                'interpret it with the exact same instructions, looking for '
+                'the deeper pattern behind how it all connects. Where they '
+                'agree, that becomes a new insight. Where they don\'t, both '
+                'answers are kept as a flagged, unresolved tension for you '
+                'to review in the memory browser — a toast tells you which '
+                'happened. Heavier than attention reflection (a full '
+                'summarization pass plus two model generations), so it '
+                'defaults to running less often.',
+                style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+              ),
+              const SizedBox(height: 8),
+              _CadenceRow(
+                getValue: () => widget.storage.frameAnalysisEveryNSweeps,
+                setValue: (v) => widget.storage.frameAnalysisEveryNSweeps = v,
+              ),
+              const SizedBox(height: 16),
+              Text('Second-Opinion Rotation Model',
+                  style: TextStyle(color: context.text, fontSize: 14)),
+              const SizedBox(height: 4),
+              Text(
+                'Optional — a spare downloaded model (one that isn\'t your '
+                'chat model or your helper) that takes alternating turns as '
+                'Frame analysis\'s second opinion, instead of always using '
+                'the helper above. Unlike the helper, this model is NOT '
+                'kept loaded: it\'s loaded only for its one turn, then torn '
+                'down right after. Since the main model, the helper, and '
+                'this one can all briefly be in memory together during '
+                'that turn, only set this if your device has the RAM to '
+                'spare for a moment.',
+                style: TextStyle(color: context.textD, fontSize: 11, height: 1.4),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _secondOpinionFilename.isEmpty
+                          ? 'Not set — always uses the helper'
+                          : _secondOpinionFilename,
+                      style: TextStyle(
+                        color: _secondOpinionFilename.isEmpty
+                            ? context.textD
+                            : context.text,
+                        fontSize: 12,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton(
+                    onPressed: () => _pickSecondOpinionModel(context),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: context.text,
+                      side: BorderSide(color: context.border),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                    child: Text(_secondOpinionFilename.isEmpty ? 'Set' : 'Change'),
+                  ),
+                  if (_secondOpinionFilename.isNotEmpty) ...[
+                    const SizedBox(width: 8),
+                    IconButton(
+                      icon: const Icon(Icons.close, size: 18),
+                      color: context.textD,
+                      onPressed: () {
+                        Get.find<ModelController>().clearSecondOpinionModel();
+                        setState(() => _secondOpinionFilename = '');
+                      },
+                      tooltip: 'Stop using a rotation model',
+                    ),
+                  ],
+                ],
+              ),
             ],
           ),
         );
       }),
+    );
+  }
+
+  void _pickSecondOpinionModel(BuildContext context) {
+    final manager = Get.find<ModelManager>();
+    // Excludes whatever's already the main chat model or the helper — the
+    // whole point of this rotation is a THIRD, otherwise-idle model taking
+    // a turn; offering the main or helper model here would let a user pick
+    // a multi-billion-parameter model that's already resident, so its
+    // rotation turn loads a second copy of it as a third concurrent
+    // engine — exactly the RAM risk this section's own description warns
+    // against, not a spare model finally getting a job.
+    final mainModelFilename = Get.find<LlmService>().loadedModelFilename;
+    final helperFilename = widget.storage.helperModelFilename;
+    final candidates = manager.downloadedModels
+        .where((f) =>
+            manager.kindOf(f) == ModelKind.chat &&
+            f != mainModelFilename &&
+            f != helperFilename)
+        .toList();
+
+    if (candidates.isEmpty) {
+      Get.snackbar(
+        'No Spare Chat Models Downloaded',
+        'Download a chat model that isn\'t already your main chat model or '
+            'your helper to use it as the second-opinion rotation model.',
+        snackPosition: SnackPosition.BOTTOM,
+      );
+      return;
+    }
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: context.bgPanel,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  'Choose a Second-Opinion Model',
+                  style: TextStyle(
+                    color: sheetContext.text,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: candidates.length,
+                  itemBuilder: (_, i) {
+                    final filename = candidates[i];
+                    return ListTile(
+                      leading: Icon(Icons.psychology_alt_outlined, color: sheetContext.textM),
+                      title: Text(
+                        filename,
+                        style: TextStyle(color: sheetContext.text, fontSize: 13),
+                      ),
+                      onTap: () {
+                        Navigator.of(sheetContext).pop();
+                        Get.find<ModelController>().setSecondOpinionModel(filename);
+                        setState(() => _secondOpinionFilename = filename);
+                      },
+                    );
+                  },
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -2084,9 +2289,59 @@ class _ExtractionGuidanceFieldState extends State<_ExtractionGuidanceField> {
   }
 }
 
-/// Stepper for the memory-health sweep interval (minutes; 0 = off).
-/// Reschedules the live timer on ChatController immediately on change,
-/// rather than only taking effect after an app restart.
+/// Stepper for [ChatStorageService.maxToolRounds].
+class _MaxToolRoundsRow extends StatefulWidget {
+  final ChatStorageService storage;
+  const _MaxToolRoundsRow({required this.storage});
+
+  @override
+  State<_MaxToolRoundsRow> createState() => _MaxToolRoundsRowState();
+}
+
+class _MaxToolRoundsRowState extends State<_MaxToolRoundsRow> {
+  late int _rounds;
+
+  @override
+  void initState() {
+    super.initState();
+    _rounds = widget.storage.maxToolRounds;
+  }
+
+  void _set(int value) {
+    final clamped = value.clamp(1, 30);
+    setState(() => _rounds = clamped);
+    widget.storage.maxToolRounds = clamped;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            '$_rounds round${_rounds == 1 ? '' : 's'}',
+            style: TextStyle(color: context.text, fontSize: 13),
+          ),
+        ),
+        IconButton(
+          icon: Icon(Icons.remove_circle_outline, size: 20, color: context.textM),
+          onPressed: () => _set(_rounds - 1),
+        ),
+        IconButton(
+          icon: Icon(Icons.add_circle_outline, size: 20, color: context.textM),
+          onPressed: () => _set(_rounds + 1),
+        ),
+      ],
+    );
+  }
+}
+
+/// Preset picker for the memory-health sweep interval, 5 seconds to 60
+/// minutes (plus off). A plain +/- stepper doesn't work across a range
+/// this wide — a step small enough to be useful at 5s would take forever
+/// to reach 3600s — so this steps through a fixed list of sensible presets
+/// instead. Reschedules the live timer on ChatController immediately on
+/// change, rather than only taking effect after an app restart.
 class _SweepIntervalRow extends StatefulWidget {
   final ChatStorageService storage;
   const _SweepIntervalRow({required this.storage});
@@ -2096,18 +2351,40 @@ class _SweepIntervalRow extends StatefulWidget {
 }
 
 class _SweepIntervalRowState extends State<_SweepIntervalRow> {
-  late int _minutes;
+  // 0 = off, then 5s up to 60min. Kept as its own ordered list (not a
+  // formula) so the displayed label and the stored value can never drift
+  // apart from a rounding difference.
+  static const _presets = <int>[
+    0, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600,
+  ];
+
+  late int _seconds;
 
   @override
   void initState() {
     super.initState();
-    _minutes = widget.storage.memorySweepIntervalMinutes;
+    _seconds = widget.storage.memorySweepIntervalSeconds;
   }
 
-  void _set(int value) {
-    final clamped = value.clamp(0, 180);
-    setState(() => _minutes = clamped);
-    widget.storage.memorySweepIntervalMinutes = clamped;
+  String _label(int seconds) {
+    if (seconds <= 0) return 'Disabled';
+    if (seconds < 60) return 'Every ${seconds}s';
+    final minutes = seconds ~/ 60;
+    return 'Every $minutes min';
+  }
+
+  void _step(int delta) {
+    var index = _presets.indexOf(_seconds);
+    if (index == -1) {
+      // A value from an older build (minutes-based) or hand-edited store —
+      // land on the closest preset rather than fail to move at all.
+      index = _presets.indexWhere((p) => p >= _seconds);
+      if (index == -1) index = _presets.length - 1;
+    }
+    final nextIndex = (index + delta).clamp(0, _presets.length - 1);
+    final value = _presets[nextIndex];
+    setState(() => _seconds = value);
+    widget.storage.memorySweepIntervalSeconds = value;
     try {
       Get.find<ChatController>().rescheduleMemorySweep();
     } catch (_) {}
@@ -2119,17 +2396,112 @@ class _SweepIntervalRowState extends State<_SweepIntervalRow> {
       children: [
         Expanded(
           child: Text(
-            _minutes <= 0 ? 'Disabled' : 'Every $_minutes min',
+            _label(_seconds),
             style: TextStyle(color: context.text, fontSize: 13),
           ),
         ),
         IconButton(
           icon: Icon(Icons.remove_circle_outline, size: 20, color: context.textM),
-          onPressed: () => _set(_minutes - 5),
+          onPressed: () => _step(-1),
         ),
         IconButton(
           icon: Icon(Icons.add_circle_outline, size: 20, color: context.textM),
-          onPressed: () => _set(_minutes + 5),
+          onPressed: () => _step(1),
+        ),
+      ],
+    );
+  }
+}
+
+/// Toggle for [ChatStorageService.sweepRequiresConfirmation] — off by
+/// default so the sweep can genuinely run in the background (essential
+/// once the interval is set to a few seconds), on for anyone who'd rather
+/// approve each cycle like the app originally required.
+class _SweepConfirmationToggle extends StatefulWidget {
+  final ChatStorageService storage;
+  const _SweepConfirmationToggle({required this.storage});
+
+  @override
+  State<_SweepConfirmationToggle> createState() => _SweepConfirmationToggleState();
+}
+
+class _SweepConfirmationToggleState extends State<_SweepConfirmationToggle> {
+  late bool _requireConfirmation;
+
+  @override
+  void initState() {
+    super.initState();
+    _requireConfirmation = widget.storage.sweepRequiresConfirmation;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            'Ask before each sweep',
+            style: TextStyle(color: context.text, fontSize: 13),
+          ),
+        ),
+        Switch(
+          value: _requireConfirmation,
+          activeTrackColor: AppColors.accent,
+          onChanged: (v) {
+            setState(() => _requireConfirmation = v);
+            widget.storage.sweepRequiresConfirmation = v;
+          },
+        ),
+      ],
+    );
+  }
+}
+
+/// Shared stepper for "every N sweep cycles" cadence settings — attention
+/// reflection and Frame analysis are otherwise-identical steppers over two
+/// different storage fields, so this takes plain get/set callbacks instead
+/// of being written out twice.
+class _CadenceRow extends StatefulWidget {
+  final int Function() getValue;
+  final void Function(int) setValue;
+  const _CadenceRow({required this.getValue, required this.setValue});
+
+  @override
+  State<_CadenceRow> createState() => _CadenceRowState();
+}
+
+class _CadenceRowState extends State<_CadenceRow> {
+  late int _everyN;
+
+  @override
+  void initState() {
+    super.initState();
+    _everyN = widget.getValue();
+  }
+
+  void _set(int value) {
+    final clamped = value.clamp(1, 200);
+    setState(() => _everyN = clamped);
+    widget.setValue(clamped);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            'Every $_everyN sweep${_everyN == 1 ? '' : 's'}',
+            style: TextStyle(color: context.text, fontSize: 13),
+          ),
+        ),
+        IconButton(
+          icon: Icon(Icons.remove_circle_outline, size: 20, color: context.textM),
+          onPressed: () => _set(_everyN - 1),
+        ),
+        IconButton(
+          icon: Icon(Icons.add_circle_outline, size: 20, color: context.textM),
+          onPressed: () => _set(_everyN + 1),
         ),
       ],
     );

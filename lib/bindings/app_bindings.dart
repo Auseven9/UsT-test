@@ -31,6 +31,15 @@ class AppBindings extends Bindings {
     Get.lazyPut(() => LogService(), fenix: true);
     Get.lazyPut(() => EmbeddingService(), fenix: true);
     Get.lazyPut(() => HelperLlmService(), fenix: true);
+    // A second, independently-tagged instance of the exact same service —
+    // not the always-loaded memory-extraction helper above, but a model
+    // that stays unloaded until Frame analysis's rotation gives it a turn
+    // as the "second opinion" (see ChatController._runFrameAnalysis and
+    // ChatStorageService.secondOpinionModelFilename), then gets torn down
+    // again right after. Same class, same load/unload discipline, just a
+    // separate engine so loading this one never disturbs the helper's own
+    // loaded model.
+    Get.lazyPut(() => HelperLlmService(), tag: 'secondOpinion', fenix: true);
     Get.lazyPut(() => MemoryService(), fenix: true);
     Get.lazyPut(() => ReasoningTraceService(), fenix: true);
     Get.lazyPut(() => ReminderService(), fenix: true);

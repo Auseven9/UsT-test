@@ -576,6 +576,30 @@ class ModelController extends GetxController {
     _storage.helperModelFilename = '';
   }
 
+  /// Records which downloaded model takes a turn as Frame analysis's
+  /// "second opinion" (see ChatStorageService.secondOpinionModelFilename)
+  /// — deliberately just a stored filename, not an immediate load. Unlike
+  /// [setHelperModel], this model isn't kept resident: ChatController
+  /// loads it transiently only when its rotation turn actually comes up,
+  /// then tears it down right after, so setting it here costs nothing
+  /// until then.
+  void setSecondOpinionModel(String filename) {
+    _storage.secondOpinionModelFilename = filename;
+    _log?.info('Second-opinion model set: $filename', source: 'Model');
+    Get.snackbar(
+      'Second-Opinion Model Set',
+      '$filename will take alternating turns in Frame analysis, loaded '
+          'only when it\'s its turn.',
+      snackPosition: SnackPosition.BOTTOM,
+    );
+  }
+
+  /// Clears the second-opinion rotation — Frame analysis goes back to
+  /// always using the regular helper model, same as before this existed.
+  void clearSecondOpinionModel() {
+    _storage.secondOpinionModelFilename = '';
+  }
+
   /// Get info for a specific filename.
   AiModelInfo? getModelInfo(String filename) {
     try {

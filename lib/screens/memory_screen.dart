@@ -185,11 +185,18 @@ class MemoryScreen extends StatelessWidget {
     final participantsController =
         TextEditingController(text: (existing?.participants ?? const []).join(', '));
     final connectionController = TextEditingController(text: existing?.connection ?? '');
-    // Includes 'summary' — not a category anything picks from this dialog,
-    // but memory consolidation (ChatController._runMemoryConsolidation)
-    // writes entries with that category, and editing one of those must not
-    // crash the dropdown for having a value with no matching item.
-    const categories = ['fact', 'preference', 'event', 'instruction', 'general', 'summary'];
+    // Includes 'summary'/'frame'/'insight'/'tension' — none of these are
+    // categories anything picks from this dialog, but the consolidation,
+    // Frame-analysis, and attention-reflection passes all write entries
+    // with these categories, and editing one of those must not crash the
+    // dropdown for having a value with no matching item. A 'tension' entry
+    // in particular is exactly the kind of thing this dialog exists to let
+    // the user resolve — reclassify it, edit the text, or delete it once
+    // reviewed.
+    const categories = [
+      'fact', 'preference', 'event', 'instruction', 'general',
+      'summary', 'frame', 'insight', 'tension',
+    ];
     const valences = ['positive', 'negative', 'neutral'];
     const memoryTypes = ['episodic', 'semantic'];
     const subjects = ['user', 'assistant'];
@@ -488,6 +495,12 @@ class _MemoryTile extends StatelessWidget {
                         _chip(context, 'working', context.textD),
                       if (entry.confidence < 0.8)
                         _chip(context, 'low confidence', AppColors.orange),
+                      if (entry.lastReflectedAt != null)
+                        _chip(
+                          context,
+                          'attention ${(entry.attentionScore * 100).round()}%',
+                          AppColors.forAttentionScore(entry.attentionScore, context.textD),
+                        ),
                       for (final tag in entry.tags) _chip(context, tag, context.textD),
                       if (superseded) _chip(context, 'superseded', AppColors.red),
                     ],
@@ -572,6 +585,12 @@ class _MemoryTile extends StatelessWidget {
         return AppColors.accentHi;
       case 'summary':
         return AppColors.accentDim;
+      case 'frame':
+        return AppColors.accentHi;
+      case 'insight':
+        return AppColors.green;
+      case 'tension':
+        return AppColors.red;
       default:
         return context.textM;
     }
