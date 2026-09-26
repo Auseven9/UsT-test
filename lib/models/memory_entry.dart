@@ -104,6 +104,39 @@ class MemoryEntry {
   /// gives everything rehearsal also updates.
   final int rehearsalCount;
 
+  /// The primary named subject this memory is about — a person, place,
+  /// project, or organization's actual name (e.g. "Alex", "the Somerset
+  /// house", "Project Chimera"), as distinct from [text] (the sentence-form
+  /// note) and [tags] (loose keywords). Empty when the memory isn't really
+  /// "about" one nameable thing. This is what lets two memories about the
+  /// same person/project be linked by identity, not just by embedding
+  /// distance — see MemoryService's entity-based auto-linking.
+  final String entityName;
+
+  /// What kind of thing [entityName] is — 'person', 'place', 'project',
+  /// 'organization', 'event', 'idea', or 'none' when there isn't a single
+  /// named entity. Purely descriptive metadata; doesn't affect retrieval.
+  final String entityType;
+
+  /// A place named in this memory, if any (e.g. "Seattle", "the office") —
+  /// separate from [entityName] since a memory can be about a person while
+  /// still being tied to a location, or vice versa.
+  final String location;
+
+  /// Other people or entities named alongside [entityName] in this memory
+  /// (e.g. a memory about a meeting might list every attendee) — used the
+  /// same way as [entityName] for identity-based auto-linking: two memories
+  /// sharing a participant are related even if their wording has little
+  /// embedding overlap.
+  final List<String> participants;
+
+  /// A short, free-text description of how [entityName] relates to
+  /// something else already known (e.g. "coworker of Alex", "a sequel to
+  /// the Somerset project") — the model's own stated reasoning for a
+  /// relationship, distinct from [linkedIds] (which just records THAT two
+  /// memories are linked, not why).
+  final String connection;
+
   const MemoryEntry({
     required this.id,
     required this.text,
@@ -123,6 +156,11 @@ class MemoryEntry {
     this.priorTexts = const [],
     this.isWorkingMemory = false,
     this.rehearsalCount = 0,
+    this.entityName = '',
+    this.entityType = 'none',
+    this.location = '',
+    this.participants = const [],
+    this.connection = '',
   }) : lastAccessedAt = lastAccessedAt ?? createdAt;
 
   bool get isActive => supersededBy == null;
@@ -149,6 +187,11 @@ class MemoryEntry {
     List<String>? priorTexts,
     bool? isWorkingMemory,
     int? rehearsalCount,
+    String? entityName,
+    String? entityType,
+    String? location,
+    List<String>? participants,
+    String? connection,
   }) {
     return MemoryEntry(
       id: id,
@@ -169,6 +212,11 @@ class MemoryEntry {
       priorTexts: priorTexts ?? this.priorTexts,
       isWorkingMemory: isWorkingMemory ?? this.isWorkingMemory,
       rehearsalCount: rehearsalCount ?? this.rehearsalCount,
+      entityName: entityName ?? this.entityName,
+      entityType: entityType ?? this.entityType,
+      location: location ?? this.location,
+      participants: participants ?? this.participants,
+      connection: connection ?? this.connection,
     );
   }
 
@@ -201,6 +249,12 @@ class MemoryEntry {
           (json['priorTexts'] as List?)?.map((e) => e as String).toList() ?? const [],
       isWorkingMemory: json['isWorkingMemory'] as bool? ?? false,
       rehearsalCount: (json['rehearsalCount'] as num?)?.toInt() ?? 0,
+      entityName: json['entityName'] as String? ?? '',
+      entityType: json['entityType'] as String? ?? 'none',
+      location: json['location'] as String? ?? '',
+      participants:
+          (json['participants'] as List?)?.map((e) => e as String).toList() ?? const [],
+      connection: json['connection'] as String? ?? '',
     );
   }
 
@@ -223,5 +277,10 @@ class MemoryEntry {
         'priorTexts': priorTexts,
         'isWorkingMemory': isWorkingMemory,
         'rehearsalCount': rehearsalCount,
+        'entityName': entityName,
+        'entityType': entityType,
+        'location': location,
+        'participants': participants,
+        'connection': connection,
       };
 }

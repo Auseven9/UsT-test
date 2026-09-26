@@ -179,6 +179,12 @@ class MemoryScreen extends StatelessWidget {
     var valence = existing?.valence ?? 'neutral';
     var memoryType = existing?.memoryType ?? 'episodic';
     var subject = existing?.subject ?? 'user';
+    var entityType = existing?.entityType ?? 'none';
+    final entityNameController = TextEditingController(text: existing?.entityName ?? '');
+    final locationController = TextEditingController(text: existing?.location ?? '');
+    final participantsController =
+        TextEditingController(text: (existing?.participants ?? const []).join(', '));
+    final connectionController = TextEditingController(text: existing?.connection ?? '');
     // Includes 'summary' — not a category anything picks from this dialog,
     // but memory consolidation (ChatController._runMemoryConsolidation)
     // writes entries with that category, and editing one of those must not
@@ -187,6 +193,9 @@ class MemoryScreen extends StatelessWidget {
     const valences = ['positive', 'negative', 'neutral'];
     const memoryTypes = ['episodic', 'semantic'];
     const subjects = ['user', 'assistant'];
+    const entityTypes = [
+      'none', 'person', 'place', 'project', 'organization', 'event', 'idea',
+    ];
     var busy = false;
 
     showDialog(
@@ -226,6 +235,23 @@ class MemoryScreen extends StatelessWidget {
                     (v) => setState(() => memoryType = v)),
                 _dropdownRow(dialogContext, 'Subject', subject, subjects,
                     (v) => setState(() => subject = v)),
+                const SizedBox(height: 12),
+                Text(
+                  'Entity — who/what this is about, for building the memory '
+                  'network (all optional)',
+                  style: TextStyle(fontSize: 11, color: dialogContext.textD),
+                ),
+                const SizedBox(height: 8),
+                _textFieldRow(dialogContext, 'Name', entityNameController,
+                    hint: 'e.g. Alex, Project Chimera'),
+                _dropdownRow(dialogContext, 'Kind', entityType, entityTypes,
+                    (v) => setState(() => entityType = v)),
+                _textFieldRow(dialogContext, 'Location', locationController,
+                    hint: 'e.g. Seattle'),
+                _textFieldRow(dialogContext, 'Participants', participantsController,
+                    hint: 'comma-separated names'),
+                _textFieldRow(dialogContext, 'Connection', connectionController,
+                    hint: 'e.g. coworker of Alex'),
               ],
             ),
           ),
@@ -279,6 +305,11 @@ class MemoryScreen extends StatelessWidget {
                           memoryType: memoryType,
                           subject: subject,
                           tags: const ['manual'],
+                          entityName: entityNameController.text.trim(),
+                          entityType: entityType,
+                          location: locationController.text.trim(),
+                          participants: _parseParticipants(participantsController.text),
+                          connection: connectionController.text.trim(),
                         );
                       } else {
                         final textChanged = text != existing.text;
@@ -304,6 +335,11 @@ class MemoryScreen extends StatelessWidget {
                           valence: valence,
                           memoryType: memoryType,
                           subject: subject,
+                          entityName: entityNameController.text.trim(),
+                          entityType: entityType,
+                          location: locationController.text.trim(),
+                          participants: _parseParticipants(participantsController.text),
+                          connection: connectionController.text.trim(),
                         );
                       }
                       if (!dialogContext.mounted) return;
@@ -323,6 +359,53 @@ class MemoryScreen extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    ).then((_) {
+      textController.dispose();
+      entityNameController.dispose();
+      locationController.dispose();
+      participantsController.dispose();
+      connectionController.dispose();
+    });
+  }
+
+  List<String> _parseParticipants(String raw) => raw
+      .split(',')
+      .map((s) => s.trim())
+      .where((s) => s.isNotEmpty)
+      .toList();
+
+  Widget _textFieldRow(
+    BuildContext context,
+    String label,
+    TextEditingController controller, {
+    required String hint,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          SizedBox(
+            width: 70,
+            child: Text(label, style: TextStyle(fontSize: 12, color: context.textD)),
+          ),
+          Expanded(
+            child: TextField(
+              controller: controller,
+              style: TextStyle(fontSize: 13, color: context.text),
+              decoration: InputDecoration(
+                hintText: hint,
+                hintStyle: TextStyle(color: context.textD, fontSize: 12),
+                isDense: true,
+                filled: true,
+                fillColor: context.bgInput,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -419,6 +502,27 @@ class _MemoryTile extends StatelessWidget {
                       decoration: superseded ? TextDecoration.lineThrough : null,
                     ),
                   ),
+                  if (entry.entityName.isNotEmpty ||
+                      entry.location.isNotEmpty ||
+                      entry.participants.isNotEmpty ||
+                      entry.connection.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      [
+                        if (entry.entityName.isNotEmpty)
+                          '${entry.entityType == 'none' ? '' : '${entry.entityType}: '}${entry.entityName}',
+                        if (entry.location.isNotEmpty) 'at ${entry.location}',
+                        if (entry.participants.isNotEmpty)
+                          'with ${entry.participants.join(', ')}',
+                        if (entry.connection.isNotEmpty) entry.connection,
+                      ].join(' · '),
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontStyle: FontStyle.italic,
+                        color: context.textM,
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 6),
                   Text(
                     '${_formatDate(entry.createdAt)}'

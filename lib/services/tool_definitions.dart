@@ -242,6 +242,37 @@ List<ToolDefinition> buildToolDefinitions({
             description: 'One of: positive, negative, neutral.',
             required: false,
           ),
+          ToolParam.string(
+            'entity_name',
+            description: 'The one named person, place, project, or '
+                'organization this is mainly about, if any. Leave empty '
+                'if there isn\'t a single named subject.',
+            required: false,
+          ),
+          ToolParam.string(
+            'entity_type',
+            description: 'One of: person, place, project, organization, '
+                'event, idea, none.',
+            required: false,
+          ),
+          ToolParam.string(
+            'location',
+            description: 'A place named in this memory, if any.',
+            required: false,
+          ),
+          ToolParam.array(
+            'participants',
+            itemType: ToolParam.string('name'),
+            description: 'Other people or entities named alongside '
+                'entity_name, if any.',
+            required: false,
+          ),
+          ToolParam.string(
+            'connection',
+            description: 'How entity_name relates to something else '
+                'already known, in a few words, if stated.',
+            required: false,
+          ),
         ],
         handler: (params) async {
           final text = params.getRequiredString('text').trim();
@@ -252,8 +283,12 @@ List<ToolDefinition> buildToolDefinitions({
           }
           const validCategories = {'fact', 'preference', 'event', 'instruction', 'general'};
           const validValences = {'positive', 'negative', 'neutral'};
+          const validEntityTypes = {
+            'person', 'place', 'project', 'organization', 'event', 'idea', 'none',
+          };
           final category = params.getString('category')?.toLowerCase();
           final valence = params.getString('valence')?.toLowerCase();
+          final entityType = params.getString('entity_type')?.toLowerCase();
           final result = await memory.addIfNotDuplicate(
             text,
             vector,
@@ -265,6 +300,11 @@ List<ToolDefinition> buildToolDefinitions({
             // conversation isn't automatically more trustworthy than the
             // background pass making the same call.
             isWorkingMemory: true,
+            entityName: params.getString('entity_name')?.trim() ?? '',
+            entityType: validEntityTypes.contains(entityType) ? entityType! : 'none',
+            location: params.getString('location')?.trim() ?? '',
+            participants: params.getList<String>('participants') ?? const [],
+            connection: params.getString('connection')?.trim() ?? '',
           );
           return {
             'saved': result.id != null,
@@ -288,6 +328,19 @@ List<ToolDefinition> buildToolDefinitions({
             description: 'The full corrected/extended text.',
             required: true,
           ),
+          ToolParam.string(
+            'entity_name',
+            description: 'Corrected/added named subject (person, place, '
+                'project, organization), if this needs fixing too.',
+            required: false,
+          ),
+          ToolParam.array(
+            'participants',
+            itemType: ToolParam.string('name'),
+            description: 'Corrected/added participants, if this needs '
+                'fixing too.',
+            required: false,
+          ),
         ],
         handler: (params) async {
           final id = params.getRequiredString('id').trim();
@@ -297,7 +350,13 @@ List<ToolDefinition> buildToolDefinitions({
           if (vector == null) {
             return {'error': 'Embedding model unavailable — nothing changed.'};
           }
-          final ok = await memory.updateEntry(id, text: newText, newEmbedding: vector);
+          final ok = await memory.updateEntry(
+            id,
+            text: newText,
+            newEmbedding: vector,
+            entityName: params.getString('entity_name')?.trim(),
+            participants: params.getList<String>('participants'),
+          );
           return {'updated': ok, if (!ok) 'error': 'No memory with that id.'};
         },
       ),
@@ -345,8 +404,9 @@ List<ToolDefinition> buildToolDefinitions({
           // hedge — so this always supersedes outright rather than
           // going through the low-confidence "keep both, flag conflict"
           // path extraction-time contradictions get. Carries the old
-          // entry's category/valence/tags forward — a correction is still
-          // the same kind of fact, not a reset to defaults.
+          // entry's category/valence/tags/entity fields forward — a
+          // correction is still the same kind of fact about the same
+          // entity, not a reset to defaults.
           final superseded = await memory.resolveContradiction(
             oldId: oldId,
             newText: newText,
@@ -355,6 +415,11 @@ List<ToolDefinition> buildToolDefinitions({
             category: oldEntry.category,
             valence: oldEntry.valence,
             tags: oldEntry.tags,
+            entityName: oldEntry.entityName,
+            entityType: oldEntry.entityType,
+            location: oldEntry.location,
+            participants: oldEntry.participants,
+            connection: oldEntry.connection,
           );
           return {
             'superseded': superseded,

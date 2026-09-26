@@ -101,6 +101,18 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
   int _lastLayoutSignature = -1;
   bool _computingLayout = false;
   String? _selectedId;
+  final TransformationController _viewController = TransformationController();
+  // Only the very first layout auto-centers the view. Recentering on every
+  // later recompute (e.g. a new memory arriving mid-session) would snap the
+  // view back to centered/1.0 scale out from under a user actively zoomed
+  // or panned into a node cluster, discarding their navigation.
+  bool _hasCenteredView = false;
+
+  @override
+  void dispose() {
+    _viewController.dispose();
+    super.dispose();
+  }
 
   /// When true, tapping nodes links/unlinks them (see [_handleTap]) instead
   /// of opening the detail sheet. [_linkAnchorId] holds the first node
@@ -114,7 +126,7 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
   /// `build()` — it only mutates state synchronously (readable in this
   /// same build pass, for the loading indicator) and the actual `setState`
   /// happens later, in the compute() callback, never during build itself.
-  void _maybeStartLayout(List<MemoryEntry> entries) {
+  void _maybeStartLayout(List<MemoryEntry> entries, Size viewportSize) {
     // Recompute only when the underlying set of entries actually changed —
     // a signature over ids+link-counts is cheap and avoids re-running the
     // layout (and losing the user's current pan/zoom orientation) on every
@@ -137,7 +149,46 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
         _positions = result;
         _computingLayout = false;
       });
+      // Without this, InteractiveViewer starts showing the canvas's raw
+      // (0,0) corner — since the force-directed layout settles the node
+      // cluster somewhere near the 1200x1200 canvas's own center rather
+      // than near (0,0), that left the whole graph sitting off to the
+      // lower right of a phone-sized viewport, needing a manual pan to
+      // even find it (and every tap landing on nothing, since there was
+      // nothing under the visible area). Centering the viewport on the
+      // actual node cluster's bounding-box centroid right after the FIRST
+      // layout fixes both, without later snapping a since-zoomed/panned
+      // view back out from under the user on every subsequent recompute.
+      if (!_hasCenteredView) {
+        // Only latch once centering actually ran — if the viewport still
+        // had zero size right at this moment (e.g. mid route-transition),
+        // _centerViewOn is a no-op, and setting the flag anyway would skip
+        // centering forever, permanently leaving the graph off-screen
+        // instead of catching it on the next layout recompute.
+        _hasCenteredView = result.isNotEmpty && viewportSize.width > 0 && viewportSize.height > 0;
+        _centerViewOn(result, viewportSize);
+      }
     });
+  }
+
+  void _centerViewOn(Map<String, Offset> positions, Size viewportSize) {
+    if (positions.isEmpty || viewportSize.width <= 0 || viewportSize.height <= 0) return;
+    var minX = double.infinity, minY = double.infinity;
+    var maxX = double.negativeInfinity, maxY = double.negativeInfinity;
+    for (final p in positions.values) {
+      minX = min(minX, p.dx);
+      maxX = max(maxX, p.dx);
+      minY = min(minY, p.dy);
+      maxY = max(maxY, p.dy);
+    }
+    final centroid = Offset((minX + maxX) / 2, (minY + maxY) / 2);
+    _viewController.value = Matrix4.identity()
+      ..translateByDouble(
+        viewportSize.width / 2 - centroid.dx,
+        viewportSize.height / 2 - centroid.dy,
+        0,
+        1,
+      );
   }
 
   Color _categoryColor(String category) {
@@ -264,6 +315,27 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
                     decoration: entry.isActive ? null : TextDecoration.lineThrough,
                   ),
                 ),
+                if (entry.entityName.isNotEmpty ||
+                    entry.location.isNotEmpty ||
+                    entry.participants.isNotEmpty ||
+                    entry.connection.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    [
+                      if (entry.entityName.isNotEmpty)
+                        '${entry.entityType == 'none' ? '' : '${entry.entityType}: '}${entry.entityName}',
+                      if (entry.location.isNotEmpty) 'at ${entry.location}',
+                      if (entry.participants.isNotEmpty)
+                        'with ${entry.participants.join(', ')}',
+                      if (entry.connection.isNotEmpty) entry.connection,
+                    ].join(' · '),
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontStyle: FontStyle.italic,
+                      color: sheetContext.textM,
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 12),
                 Text(
                   'Recalled ${entry.accessCount}× · ${entry.linkedIds.length} linked · '
@@ -350,42 +422,47 @@ class _MemoryGraphScreenState extends State<MemoryGraphScreen> {
               ),
             ),
           Expanded(
-            child: Obx(() {
-              final entries = memory.entries.toList();
-              if (entries.isEmpty) {
-                return Center(
-                  child: Text('Nothing remembered yet.', style: TextStyle(color: context.textD)),
-                );
-              }
-              _maybeStartLayout(entries);
-              if (_computingLayout && _positions.isEmpty) {
-                return const Center(child: CircularProgressIndicator());
-              }
-              return InteractiveViewer(
-                maxScale: 4,
-                minScale: 0.2,
-                boundaryMargin: const EdgeInsets.all(200),
-                child: GestureDetector(
-                  onTapUp: (details) => _handleTap(details.localPosition, entries),
-                  child: SizedBox(
-                    width: _kGraphCanvasSize,
-                    height: _kGraphCanvasSize,
-                    child: CustomPaint(
-                      painter: _GraphPainter(
-                        entries: entries,
-                        positions: _positions,
-                        // The highlight ring doubles as the link-mode
-                        // anchor indicator — same visual, different meaning
-                        // depending on mode, so no extra painter logic.
-                        selectedId: _linkMode ? _linkAnchorId : _selectedId,
-                        categoryColor: _categoryColor,
-                        nodeRadius: _nodeRadius,
-                        isDark: context.isDark,
+            child: LayoutBuilder(builder: (context, constraints) {
+              final viewportSize = Size(constraints.maxWidth, constraints.maxHeight);
+              return Obx(() {
+                final entries = memory.entries.toList();
+                if (entries.isEmpty) {
+                  return Center(
+                    child: Text('Nothing remembered yet.', style: TextStyle(color: context.textD)),
+                  );
+                }
+                _maybeStartLayout(entries, viewportSize);
+                if (_computingLayout && _positions.isEmpty) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                return InteractiveViewer(
+                  transformationController: _viewController,
+                  maxScale: 4,
+                  minScale: 0.2,
+                  boundaryMargin: const EdgeInsets.all(200),
+                  child: GestureDetector(
+                    onTapUp: (details) => _handleTap(details.localPosition, entries),
+                    child: SizedBox(
+                      width: _kGraphCanvasSize,
+                      height: _kGraphCanvasSize,
+                      child: CustomPaint(
+                        painter: _GraphPainter(
+                          entries: entries,
+                          positions: _positions,
+                          // The highlight ring doubles as the link-mode
+                          // anchor indicator — same visual, different
+                          // meaning depending on mode, so no extra painter
+                          // logic.
+                          selectedId: _linkMode ? _linkAnchorId : _selectedId,
+                          categoryColor: _categoryColor,
+                          nodeRadius: _nodeRadius,
+                          isDark: context.isDark,
+                        ),
                       ),
                     ),
                   ),
-                ),
-              );
+                );
+              });
             }),
           ),
         ],

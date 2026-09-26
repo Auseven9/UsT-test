@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
@@ -58,7 +59,10 @@ const defaultMemoryExtractionGuidance =
     'personal details, or something they explicitly asked to be remembered '
     '(if they said "remember that" or similar, figure out from the '
     'exchange what "that" refers to and capture the actual content, not '
-    'the instruction itself).';
+    'the instruction itself). Only capture what the user themself stated '
+    'about themself or their own life — never store something the '
+    'assistant said about itself, and never attribute the assistant\'s own '
+    'claims or opinions to the user.';
 
 class ChatController extends GetxController {
   final LlmService _llm = Get.find<LlmService>();
@@ -374,36 +378,103 @@ class ChatController extends GetxController {
         .map((e) => '${e.$1 + 1}. ${_capMemoryText(e.$2.text)}')
         .join('\n');
 
+    // Unlike per-turn extraction (which paraphrases real verbatim exchange
+    // text — low hallucination risk), this is a genuinely generative task:
+    // asking a small model to freely describe a "connection" between
+    // unrelated notes is exactly the kind of open-ended creative-writing
+    // prompt small quantized models confabulate on, routinely inventing
+    // names/details that appear nowhere in the source notes. Two guards
+    // against that: (1) the model must cite which numbered notes it's
+    // connecting, so a connection to nothing (or to notes that don't
+    // exist) is a parseable, rejectable failure rather than free text; (2)
+    // after embedding its own sentence, that embedding must actually sit
+    // close to the notes it claims to connect — a fabricated addition
+    // drifts away from its cited sources in embedding space even when the
+    // wording sounds plausible.
     final request = <LlamaChatMessage>[
       LlamaChatMessage.fromText(
         role: LlamaChatRole.system,
         text: 'You review a handful of previously remembered notes and '
             'look for one genuine connection worth recording — e.g. two '
             'notes that are about the same person or project, or one that '
-            'adds context to another. If you find a real connection, '
-            'respond with ONLY a single short sentence capturing it. If '
-            'nothing meaningfully connects, respond with exactly NONE.',
+            'adds context to another. Only state something that is '
+            'already explicitly present in the notes you cite — never '
+            'invent a new name, date, number, or detail that isn\'t '
+            'already written in them. Respond with ONLY a single-line '
+            'JSON object, no other text: {"connection": "<one short '
+            'sentence, or empty string if nothing connects>", "cites": '
+            '[<numbers of the notes below it draws on, at least two, or '
+            'empty if nothing connects>], "confidence": <0.0-1.0, how '
+            'sure you are this is a real connection actually stated in '
+            'those notes, not an inference or guess>}',
       ),
       LlamaChatMessage.fromText(role: LlamaChatRole.user, text: listing),
     ];
 
-    String? out;
+    String? raw;
     try {
-      out = await _helper.complete(request, maxTokens: 60).timeout(const Duration(seconds: 25));
+      raw = await _helper.complete(request, maxTokens: 100).timeout(const Duration(seconds: 25));
     } on TimeoutException {
       _helper.stopGeneration();
       _log?.warn('Memory consolidation timed out.', source: 'Memory');
       return;
     }
-    if (out == null) return;
-    out = out.trim();
-    if (MemoryHeuristics.isNoMemorySentinel(out)) {
+    if (raw == null) return;
+    final parsed = _parseConsolidationJson(raw.trim());
+    if (parsed == null) {
+      _log?.warn('Memory consolidation discarded: malformed JSON.', source: 'Memory');
+      return;
+    }
+    final out = parsed.connection;
+    if (out.isEmpty || MemoryHeuristics.isNoMemorySentinel(out)) {
       _log?.info('Memory consolidation: nothing to connect.', source: 'Memory');
+      return;
+    }
+    final citedEntries = parsed.cites.toSet()
+        .where((i) => i >= 1 && i <= sample.length)
+        .map((i) => sample[i - 1])
+        .toList();
+    if (citedEntries.length < 2) {
+      _log?.warn(
+        'Memory consolidation discarded: cited fewer than two real notes.',
+        source: 'Memory',
+      );
+      return;
+    }
+    const consolidationConfidenceThreshold = 0.6;
+    if (parsed.confidence < consolidationConfidenceThreshold) {
+      _log?.info(
+        'Memory consolidation discarded: below confidence threshold '
+        '(${parsed.confidence}).',
+        source: 'Memory',
+      );
       return;
     }
 
     final vector = await _embedding.embed(out);
     if (vector == null) return;
+
+    // Grounding check: the new sentence's embedding must sit reasonably
+    // close to at least one of the notes it claims to connect. A genuine
+    // connecting sentence paraphrases content already in those notes, so it
+    // stays near them in embedding space; a confabulated addition (a name
+    // or detail invented rather than drawn from the notes) tends to drift
+    // away from all of them even when the citation itself was honest about
+    // which notes it meant to reference.
+    const groundingThreshold = 0.35;
+    final maxSimilarity = citedEntries
+        .map((e) => _memory.cosineSimilarity(vector, e.embedding))
+        .fold<double>(0.0, max);
+    if (maxSimilarity < groundingThreshold) {
+      _log?.warn(
+        'Memory consolidation discarded: ungrounded (similarity '
+        '${maxSimilarity.toStringAsFixed(2)} to its own cited notes) — '
+        'likely a hallucinated connection: "$out"',
+        source: 'Memory',
+      );
+      return;
+    }
+
     final result = await _memory.addIfNotDuplicate(
       out,
       vector,
@@ -426,6 +497,41 @@ class ChatController extends GetxController {
       _toast('Memory consolidated: ${_truncateForToast(out)}');
     } else {
       _log?.info('Memory consolidation: reinforced existing note.', source: 'Memory');
+    }
+  }
+
+  /// Parses the consolidation prompt's `{"connection", "cites", "confidence"}`
+  /// JSON — same lenient-but-safe shape as [_parseExtractionJson], but with
+  /// no truncated-fragment fallback: an ungrounded free-text recovery would
+  /// defeat the whole point of requiring citations, so a malformed response
+  /// here is discarded outright rather than partially salvaged.
+  ({String connection, List<int> cites, double confidence})?
+      _parseConsolidationJson(String raw) {
+    try {
+      final start = raw.indexOf('{');
+      final end = raw.lastIndexOf('}');
+      if (start == -1 || end == -1 || end <= start) return null;
+      final decoded = jsonDecode(raw.substring(start, end + 1));
+      if (decoded is! Map) return null;
+
+      final connection = (decoded['connection'] as Object?)?.toString().trim() ?? '';
+      final citesRaw = decoded['cites'];
+      final cites = citesRaw is List
+          ? citesRaw
+              .map((e) => e is num ? e.toInt() : int.tryParse(e.toString()))
+              .whereType<int>()
+              .toList()
+          : <int>[];
+      final confidenceRaw = decoded['confidence'];
+      final confidence = (confidenceRaw is num
+                  ? confidenceRaw.toDouble()
+                  : double.tryParse(confidenceRaw?.toString() ?? ''))
+              ?.clamp(0.0, 1.0) ??
+          0.0;
+
+      return (connection: connection, cites: cites, confidence: confidence);
+    } catch (_) {
+      return null;
     }
   }
 
@@ -1408,8 +1514,11 @@ class ChatController extends GetxController {
       );
 
       // A bit more room than a one-sentence extraction needed, to fit the
-      // small JSON structure (text/category/valence/tags) below.
-      const extractionMaxTokens = 130;
+      // JSON structure below — bumped from 130 when entity_name/entity_type/
+      // location/participants/connection were added alongside the original
+      // text/category/valence/tags fields, since that's meaningfully more
+      // JSON for the same token budget to cover.
+      const extractionMaxTokens = 220;
 
       // A long exchange (a big assistant reply is exactly the case most
       // likely to actually contain something worth remembering) can exceed
@@ -1444,11 +1553,14 @@ class ChatController extends GetxController {
           customGuidance.isEmpty ? defaultMemoryExtractionGuidance : customGuidance;
 
       // JSON-format instructions + trailing overhead is roughly fixed
-      // regardless of guidance (~200 tokens); the guidance text itself is
-      // added on top since it's no longer a fixed size now that it's user-
-      // editable — a long custom override correctly eats into the budget
-      // left for the actual exchange instead of silently overflowing it.
-      const baseOverheadTokens = 200;
+      // regardless of guidance (~280 tokens now that the schema also
+      // describes entity_name/entity_type/location/participants/
+      // connection, not just text/category/valence/tags); the guidance
+      // text itself is added on top since it's no longer a fixed size now
+      // that it's user-editable — a long custom override correctly eats
+      // into the budget left for the actual exchange instead of silently
+      // overflowing it.
+      const baseOverheadTokens = 280;
       final guidanceTokens = (guidance.length / approxCharsPerToken).ceil();
       final overheadTokens = baseOverheadTokens + guidanceTokens;
       final availableTokens =
@@ -1471,6 +1583,18 @@ class ChatController extends GetxController {
               'which one (if any) the new exchange contradicts/updates (e.g. '
               'a changed fact):\n${relevantMemories.indexed.map((e) => '${e.$1 + 1}. ${_capMemoryText(e.$2.text)}').join('\n')}';
 
+      // The exchange is folded into ONE user-role message (labeled
+      // "[USER]"/"[ASSISTANT]" lines), never fed as real user/assistant chat
+      // turns. Feeding it as actual turns — a user turn, then an assistant
+      // turn holding aiMsg's own text — puts the model "in character" as
+      // the assistant that just spoke, continuing that same dialogue: small
+      // quantized models (Phi, Gemma-2-2B both showed this) then blur first-
+      // person ("I") between the two speakers when asked to describe the
+      // exchange afterward, mislabeling who said what in the extracted note.
+      // Collapsing to a single labeled block plus an explicit "you are an
+      // outside observer, never a participant" instruction removes the fake
+      // assistant turn entirely, so there's nothing for the model to
+      // "continue being" — it only ever sees itself as a note-taker.
       final extractionRequest = <LlamaChatMessage>[
         LlamaChatMessage.fromText(
           role: LlamaChatRole.system,
@@ -1480,18 +1604,33 @@ class ChatController extends GetxController {
               '{"text": "<one short sentence, or empty string if nothing '
               'durable>", "category": "<fact|preference|event|instruction|'
               'general>", "valence": "<positive|negative|neutral>", '
-              '"tags": ["<a few short keywords>"], "contradicts_index": '
-              '<the number of the already-remembered item above that this '
-              'replaces/updates, or null if none>, "confidence": <0.0-1.0, '
-              'how sure you are this is actually true and durable — use a '
-              'low number for a guess or something ambiguous, a high '
-              'number only when it was stated plainly>}',
+              '"tags": ["<a few short keywords>"], "entity_name": "<the '
+              'one named person, place, project, or organization this is '
+              'mainly about, or empty string if there isn\'t one>", '
+              '"entity_type": "<person|place|project|organization|event|'
+              'idea|none>", "location": "<a place named in this, or empty '
+              'string>", "participants": ["<other people/entities named '
+              'alongside entity_name, if any>"], "connection": "<how '
+              'entity_name relates to something else already known, in a '
+              'few words, or empty string if not stated>", '
+              '"contradicts_index": <the number of the already-remembered '
+              'item above that this replaces/updates, or null if none>, '
+              '"confidence": <0.0-1.0, how sure you are this is actually '
+              'true and durable — use a low number for a guess or '
+              'something ambiguous, a high number only when it was stated '
+              'plainly>}',
         ),
-        LlamaChatMessage.fromText(role: LlamaChatRole.user, text: cap(userMsg.content)),
-        LlamaChatMessage.fromText(role: LlamaChatRole.assistant, text: cap(aiMsg.content)),
         LlamaChatMessage.fromText(
           role: LlamaChatRole.user,
-          text: 'Extract anything worth remembering from the exchange above '
+          text: 'You are an outside note-taker reviewing a transcript below. '
+              'You did NOT take part in it — you are neither speaker. Never '
+              'write in first person ("I", "me", "my"); always say '
+              '"the user" or "the assistant" explicitly when it matters who '
+              'said what, and never swap the two.\n\n'
+              'Transcript:\n'
+              '[USER]: ${cap(userMsg.content)}\n'
+              '[ASSISTANT]: ${cap(aiMsg.content)}\n\n'
+              'Extract anything worth remembering from the transcript above '
               'as that JSON object, and nothing else.',
         ),
       ];
@@ -1504,6 +1643,11 @@ class ChatController extends GetxController {
         List<String> tags,
         int? contradictsIndex,
         double confidence,
+        String entityName,
+        String entityType,
+        String location,
+        List<String> participants,
+        String connection,
       })? parsed;
 
       // Up to two attempts: a small quantized model producing malformed
@@ -1569,6 +1713,11 @@ class ChatController extends GetxController {
               ? relevantMemories[contradictsIndex - 1]
               : null;
       final confidence = parsed?.confidence ?? 1.0;
+      final entityName = parsed?.entityName ?? '';
+      final entityType = parsed?.entityType ?? 'none';
+      final entityLocation = parsed?.location ?? '';
+      final participants = parsed?.participants ?? const <String>[];
+      final connection = parsed?.connection ?? '';
 
       if (onDryRunResult != null) {
         onDryRunResult(noteText, category, valence, confidence);
@@ -1614,6 +1763,11 @@ class ChatController extends GetxController {
           valence: valence,
           tags: tags,
           sourceChatId: chatId,
+          entityName: entityName,
+          entityType: entityType,
+          location: entityLocation,
+          participants: participants,
+          connection: connection,
         );
         if (!resolved) {
           // The memory being corrected was deleted out from under this
@@ -1656,6 +1810,11 @@ class ChatController extends GetxController {
           // by actually getting reinforced, rather than being permanent the
           // instant it's written.
           isWorkingMemory: true,
+          entityName: entityName,
+          entityType: entityType,
+          location: entityLocation,
+          participants: participants,
+          connection: connection,
         );
         if (result.wasNew) {
           _log?.info('Memory saved: "$noteText" ($category/$valence)', source: 'Memory');
@@ -1697,10 +1856,18 @@ class ChatController extends GetxController {
     List<String> tags,
     int? contradictsIndex,
     double confidence,
+    String entityName,
+    String entityType,
+    String location,
+    List<String> participants,
+    String connection,
   })?
       _parseExtractionJson(String raw) {
     const validCategories = {'fact', 'preference', 'event', 'instruction', 'general'};
     const validValences = {'positive', 'negative', 'neutral'};
+    const validEntityTypes = {
+      'person', 'place', 'project', 'organization', 'event', 'idea', 'none',
+    };
 
     try {
       final start = raw.indexOf('{');
@@ -1719,6 +1886,19 @@ class ChatController extends GetxController {
                   .take(5)
                   .toList()
               : <String>[];
+          final entityName = (decoded['entity_name'] as Object?)?.toString().trim() ?? '';
+          final entityTypeRaw =
+              (decoded['entity_type'] as Object?)?.toString().toLowerCase();
+          final entityLocation = (decoded['location'] as Object?)?.toString().trim() ?? '';
+          final participantsRaw = decoded['participants'];
+          final participants = participantsRaw is List
+              ? participantsRaw
+                  .map((e) => e.toString().trim())
+                  .where((e) => e.isNotEmpty)
+                  .take(10)
+                  .toList()
+              : <String>[];
+          final connection = (decoded['connection'] as Object?)?.toString().trim() ?? '';
           // Accept a real JSON number or a stringified one ("2") — a small
           // quantized model quoting a number is a common enough formatting
           // slip. null/"null"/missing/anything else means "no contradiction".
@@ -1753,6 +1933,11 @@ class ChatController extends GetxController {
             tags: tags,
             contradictsIndex: contradictsIndex,
             confidence: confidence,
+            entityName: entityName,
+            entityType: validEntityTypes.contains(entityTypeRaw) ? entityTypeRaw! : 'none',
+            location: entityLocation,
+            participants: participants,
+            connection: connection,
           );
         }
       }
@@ -1780,6 +1965,13 @@ class ChatController extends GetxController {
       // way to know if the model would have hedged in the part that got
       // cut off.
       confidence: 0.5,
+      // Everything past "text" was cut off before it could be recovered —
+      // no entity fields to salvage from a fragment this short.
+      entityName: '',
+      entityType: 'none',
+      location: '',
+      participants: const [],
+      connection: '',
     );
   }
 

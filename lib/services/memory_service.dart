@@ -123,6 +123,11 @@ class MemoryService extends GetxService {
     String memoryType = 'episodic',
     String subject = 'user',
     bool isWorkingMemory = false,
+    String entityName = '',
+    String entityType = 'none',
+    String location = '',
+    List<String> participants = const [],
+    String connection = '',
   }) async {
     if (text.trim().isEmpty || embedding.isEmpty) return null;
 
@@ -132,7 +137,7 @@ class MemoryService extends GetxService {
     // same net effect as the original inline version, just shared with the
     // enrichment path in addIfNotDuplicate, which needs the remove-stale-
     // links half too when an entry's embedding actually changes.
-    final linkedIds = _relink(id, embedding);
+    final linkedIds = _relink(id, embedding, entityName: entityName, participants: participants);
 
     entries.add(MemoryEntry(
       id: id,
@@ -148,6 +153,11 @@ class MemoryService extends GetxService {
       memoryType: memoryType,
       subject: subject,
       isWorkingMemory: isWorkingMemory,
+      entityName: entityName,
+      entityType: entityType,
+      location: location,
+      participants: participants,
+      connection: connection,
     ));
     await _persist();
     return id;
@@ -160,16 +170,56 @@ class MemoryService extends GetxService {
   /// for [entryId] itself — the caller is responsible for actually storing
   /// that on [entryId]'s own entry, since [entryId] may not exist in
   /// [entries] yet (called from [add] before the new entry is inserted).
-  List<String> _relink(String entryId, List<double> embedding) {
+  List<String> _relink(
+    String entryId,
+    List<double> embedding, {
+    String entityName = '',
+    List<String> participants = const [],
+  }) {
+    // Entity-identity matches take priority over pure embedding proximity:
+    // two memories naming the same person/place/project are related even
+    // when their wording embeds nowhere near each other (e.g. "Alex started
+    // a new job" vs. "Alex's birthday is in March") — exactly the kind of
+    // connection embedding similarity alone misses, which is the whole
+    // point of carrying structured entity fields in the first place.
+    final normEntity = entityName.trim().toLowerCase();
+    final normParticipants = participants
+        .map((p) => p.trim().toLowerCase())
+        .where((p) => p.isNotEmpty)
+        .toSet();
+
+    bool sharesEntity(MemoryEntry other) {
+      if (normEntity.isEmpty && normParticipants.isEmpty) return false;
+      final otherEntity = other.entityName.trim().toLowerCase();
+      final otherParticipants =
+          other.participants.map((p) => p.trim().toLowerCase()).toSet();
+      if (normEntity.isNotEmpty &&
+          (otherEntity == normEntity || otherParticipants.contains(normEntity))) {
+        return true;
+      }
+      if (otherEntity.isNotEmpty && normParticipants.contains(otherEntity)) return true;
+      return normParticipants.intersection(otherParticipants).isNotEmpty;
+    }
+
+    final entityMatchIds = <String>[];
     final scored = <MapEntry<MemoryEntry, double>>[];
     for (final entry in entries) {
       if (entry.id == entryId || !entry.isActive) continue;
+      if (sharesEntity(entry)) {
+        entityMatchIds.add(entry.id);
+        continue;
+      }
       final score = _cosineSimilarity(embedding, entry.embedding);
       if (score >= _linkThreshold) scored.add(MapEntry(entry, score));
     }
     scored.sort((a, b) => b.value.compareTo(a.value));
-    final newNeighborIds =
-        scored.take(_maxLinksPerNode).map((e) => e.key.id).toSet();
+    // A Set built from this order keeps entity matches first (insertion
+    // order), so the cap below drops the weakest embedding-only matches
+    // before it ever drops a real shared-entity link.
+    final newNeighborIds = <String>{
+      ...entityMatchIds,
+      ...scored.map((e) => e.key.id),
+    }.take(_maxLinksPerNode).toSet();
 
     for (var i = 0; i < entries.length; i++) {
       final e = entries[i];
@@ -249,6 +299,11 @@ class MemoryService extends GetxService {
     String memoryType = 'episodic',
     String subject = 'user',
     bool isWorkingMemory = false,
+    String entityName = '',
+    String entityType = 'none',
+    String location = '',
+    List<String> participants = const [],
+    String connection = '',
   }) async {
     final trimmedNew = text.trim();
     if (trimmedNew.isEmpty || embedding.isEmpty) {
@@ -297,12 +352,28 @@ class MemoryService extends GetxService {
                 // updates in place, so without this the prior wording would
                 // just be gone with no record it ever said that.
                 priorTexts: [...existing.priorTexts, existing.text],
+                // Same "don't clobber a meaningful existing classification
+                // with whatever a later caller happens to pass" reasoning as
+                // category/valence above — only fill these in if the
+                // existing entry never had them; participants merge instead,
+                // since a fuller mention of the same event naming more
+                // people shouldn't drop the ones already recorded.
+                entityName: existing.entityName.isEmpty ? entityName : null,
+                entityType: existing.entityType == 'none' ? entityType : null,
+                location: existing.location.isEmpty ? location : null,
+                participants: {...existing.participants, ...participants}.toList(),
+                connection: existing.connection.isEmpty ? connection : null,
                 // The embedding just changed, possibly substantially (a
                 // bare name enriched into a full sentence) — recompute
                 // this entry's place in the associative graph rather than
                 // leaving it pointing at neighbors picked for the old,
                 // narrower embedding.
-                linkedIds: _relink(existing.id, embedding),
+                linkedIds: _relink(
+                  existing.id,
+                  embedding,
+                  entityName: existing.entityName.isEmpty ? entityName : existing.entityName,
+                  participants: {...existing.participants, ...participants}.toList(),
+                ),
                 accessCount: existing.accessCount + 1,
                 lastAccessedAt: DateTime.now(),
               )
@@ -325,6 +396,11 @@ class MemoryService extends GetxService {
       memoryType: memoryType,
       subject: subject,
       isWorkingMemory: isWorkingMemory,
+      entityName: entityName,
+      entityType: entityType,
+      location: location,
+      participants: participants,
+      connection: connection,
     );
     return (wasNew: true, wasEnriched: false, id: newId);
   }
@@ -367,6 +443,11 @@ class MemoryService extends GetxService {
     String valence = 'neutral',
     List<String> tags = const [],
     String? sourceChatId,
+    String entityName = '',
+    String entityType = 'none',
+    String location = '',
+    List<String> participants = const [],
+    String connection = '',
   }) async {
     final oldIdx = entries.indexWhere((e) => e.id == oldId);
     if (oldIdx == -1) return false;
@@ -380,6 +461,11 @@ class MemoryService extends GetxService {
         valence: valence,
         tags: tags,
         confidence: confidence,
+        entityName: entityName,
+        entityType: entityType,
+        location: location,
+        participants: participants,
+        connection: connection,
       );
       if (newId == null) return false;
       await markSuperseded(oldId, newId);
@@ -405,6 +491,11 @@ class MemoryService extends GetxService {
       // runWorkingMemoryMaintenance if never reinforced instead of
       // cluttering the store permanently.
       isWorkingMemory: true,
+      entityName: entityName,
+      entityType: entityType,
+      location: location,
+      participants: participants,
+      connection: connection,
     );
     if (newId == null) return false;
     await linkManually(oldId, newId);
@@ -434,23 +525,44 @@ class MemoryService extends GetxService {
     List<String>? tags,
     String? memoryType,
     String? subject,
+    String? entityName,
+    String? entityType,
+    String? location,
+    List<String>? participants,
+    String? connection,
   }) async {
     final idx = entries.indexWhere((e) => e.id == id);
     if (idx == -1) return false;
     final existing = entries[idx];
     final textChanged = text != null && text.trim() != existing.text;
+    // Entity fields can change the graph even when the text/embedding
+    // doesn't (e.g. correcting a misspelled name, or adding a participant
+    // the extraction model missed) — re-link whenever either the embedding
+    // or the entity identity actually changed, not just on a text edit.
+    final entityChanged = entityName != null || participants != null;
+    final relinkEmbedding = (textChanged ? newEmbedding : null) ?? existing.embedding;
     entries[idx] = existing.copyWith(
       text: textChanged ? text.trim() : null,
       embedding: textChanged ? newEmbedding : null,
       priorTexts: textChanged ? [...existing.priorTexts, existing.text] : null,
-      linkedIds: (textChanged && newEmbedding != null)
-          ? _relink(id, newEmbedding)
+      linkedIds: (textChanged && newEmbedding != null) || entityChanged
+          ? _relink(
+              id,
+              relinkEmbedding,
+              entityName: entityName ?? existing.entityName,
+              participants: participants ?? existing.participants,
+            )
           : null,
       category: category,
       valence: valence,
       tags: tags,
       memoryType: memoryType,
       subject: subject,
+      entityName: entityName,
+      entityType: entityType,
+      location: location,
+      participants: participants,
+      connection: connection,
       lastAccessedAt: DateTime.now(),
     );
     await _persist();
@@ -757,6 +869,12 @@ class MemoryService extends GetxService {
     await _persist();
     return chosen.map((e) => e.id).toList();
   }
+
+  /// Public entry point for [_cosineSimilarity] — used by callers outside
+  /// this service (e.g. the consolidation sweep in ChatController) that
+  /// need to check a candidate note's embedding against a source memory's
+  /// before trusting a model-generated claim about it.
+  double cosineSimilarity(List<double> a, List<double> b) => _cosineSimilarity(a, b);
 
   double _cosineSimilarity(List<double> a, List<double> b) {
     if (a.isEmpty || b.isEmpty || a.length != b.length) return 0.0;
